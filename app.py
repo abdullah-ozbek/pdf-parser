@@ -3141,6 +3141,17 @@ def extract_pdf():
             document
         )
 
+        # Serialize the exact extracted structure once here.
+        # Make.com can pass this string directly to /create-docx without
+        # rebuilding nested pages/elements arrays or re-extracting the PDF.
+        structure_json = json.dumps(
+            {
+                "pages": pages,
+                "elements": elements,
+            },
+            ensure_ascii=False,
+        )
+
         return jsonify({
             "filename": uploaded_file.filename,
             "page_count": len(pages),
@@ -3188,6 +3199,7 @@ def extract_pdf():
             ),
             "pages": pages,
             "elements": elements,
+            "structure_json": structure_json,
             "chunks": chunks,
         })
 
