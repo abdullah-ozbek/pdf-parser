@@ -101,6 +101,11 @@ FORM_LABEL_ON_LINE_TOLERANCE_PT = 2.5
 FORM_LABEL_COLORED_MAX_DISTANCE_PT = 4.0
 FORM_FIELD_BLANK_HEIGHT_PT = 13.0
 
+# Colored + emphasized text around form geometry is usually a section heading
+# rather than a fillable-field label. Keep this generic: no page numbers,
+# document-specific words, or fixed coordinates are used.
+FORM_SECTION_HEADING_MIN_FONT_PT = 8.5
+
 # Footer detection
 ENABLE_FOOTER_DETECTION = True
 FOOTER_SEARCH_REGION_START_RATIO = 0.60
@@ -743,10 +748,16 @@ def find_form_label(field_line, raw_blocks):
             center_distance = abs(center_field - center_text)
 
             line_color = line_dominant_color(line_data)
-            # Colored text in forms is often a section/subsection heading.
-            # Do not consume it as a field label unless it sits essentially
-            # on the field line itself. This preserves colored subheadings in
-            # arbitrary PDFs without relying on specific words or page numbers.
+
+            # A visually emphasized colored line is structural form text, not
+            # a fillable-field label. Some PDFs draw a decorative underline
+            # immediately beneath such headings; without this guard that line
+            # was mistaken for an input field and the heading disappeared.
+            if line_is_form_section_heading(line_data):
+                continue
+
+            # Other colored text is also less likely to be a field label when
+            # it is not sitting directly on the writing line.
             if (
                 not color_is_near_black(line_color)
                 and abs(vertical_distance) > FORM_LABEL_COLORED_MAX_DISTANCE_PT
@@ -812,6 +823,37 @@ def color_is_near_black(hex_color):
         return max(r, g, b) <= 70
     except Exception:
         return True
+
+
+def line_is_form_section_heading(line_data):
+    """Detect an emphasized colored form section heading.
+
+    This deliberately uses visual properties only. A colored bold/semibold
+    line with a normal heading-sized font is treated as structural text and
+    must not be consumed as the label of a nearby horizontal form line.
+    """
+    spans = [
+        span for span in (line_data.get("spans", []) or [])
+        if clean_text(span.get("text", ""))
+    ]
+    if not spans:
+        return False
+
+    color = line_dominant_color(line_data)
+    if color_is_near_black(color):
+        return False
+
+    sizes = [float(span.get("size", 0) or 0) for span in spans]
+    max_size = max(sizes) if sizes else 0.0
+    emphasized = any(
+        bool(span.get("bold"))
+        or "bold" in str(span.get("font", "")).lower()
+        or "semibold" in str(span.get("font", "")).lower()
+        or "demi" in str(span.get("font", "")).lower()
+        for span in spans
+    )
+
+    return emphasized and max_size >= FORM_SECTION_HEADING_MIN_FONT_PT
 
 
 def classify_label_position(label_bbox, field_y):
@@ -2573,6 +2615,10 @@ def add_form_heading_block(
             "italic",
             False,
         )
+    )
+    apply_hex_font_color(
+        run,
+        style.get("color", "#000000"),
     )
 
     return y1
