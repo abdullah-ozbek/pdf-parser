@@ -5,6 +5,10 @@ import fitz
 import json
 import re
 import statistics
+import os
+import gzip
+import time
+import uuid
 from difflib import SequenceMatcher
 
 from io import BytesIO
@@ -25,6 +29,17 @@ app = Flask(__name__)
 # ============================================================
 
 CHUNK_SIZE = 40
+
+# Extracted PDF structures are kept temporarily on the Render instance so
+# Make.com only needs to pass a small structure_id to /create-docx.
+STRUCTURE_STORE_DIR = os.environ.get(
+    "STRUCTURE_STORE_DIR",
+    "/tmp/pdf_translator_structures",
+)
+STRUCTURE_TTL_SECONDS = int(os.environ.get(
+    "STRUCTURE_TTL_SECONDS",
+    str(6 * 60 * 60),
+))
 
 DEFAULT_FONT_NAME = "Arial"
 DEFAULT_FONT_SIZE = 10
@@ -3112,6 +3127,98 @@ def create_word_from_structure(
     return output
 
 # ============================================================
+# TEMPORARY STRUCTURE STORE
+# ============================================================
+
+def _ensure_structure_store():
+    os.makedirs(STRUCTURE_STORE_DIR, exist_ok=True)
+
+
+def _structure_path(structure_id):
+    if not isinstance(structure_id, str) or not re.fullmatch(r"[0-9a-f]{32}", structure_id):
+        raise ValueError("Invalid structure_id")
+    return os.path.join(STRUCTURE_STORE_DIR, f"{structure_id}.json.gz")
+
+
+def cleanup_expired_structures():
+    """Best-effort cleanup of expired temporary structure files."""
+    try:
+        _ensure_structure_store()
+        cutoff = time.time() - STRUCTURE_TTL_SECONDS
+        for name in os.listdir(STRUCTURE_STORE_DIR):
+            if not name.endswith(".json.gz"):
+                continue
+            path = os.path.join(STRUCTURE_STORE_DIR, name)
+            try:
+                if os.path.isfile(path) and os.path.getmtime(path) < cutoff:
+                    os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def save_extracted_structure(pages, elements, original_filename=None):
+    """Persist the exact extraction result and return a small opaque ID."""
+    _ensure_structure_store()
+    cleanup_expired_structures()
+
+    structure_id = uuid.uuid4().hex
+    path = _structure_path(structure_id)
+    tmp_path = f"{path}.tmp"
+
+    payload = {
+        "created_at": time.time(),
+        "filename": original_filename or "translated.pdf",
+        "pages": pages,
+        "elements": elements,
+    }
+
+    with gzip.open(tmp_path, "wt", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, separators=(",", ":"))
+
+    os.replace(tmp_path, path)
+    return structure_id
+
+
+def load_extracted_structure(structure_id):
+    """Load a structure previously created by /extract-pdf."""
+    cleanup_expired_structures()
+    path = _structure_path(structure_id)
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(
+            "structure_id was not found or has expired. Run /extract-pdf again."
+        )
+
+    age = time.time() - os.path.getmtime(path)
+    if age > STRUCTURE_TTL_SECONDS:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise FileNotFoundError(
+            "structure_id has expired. Run /extract-pdf again."
+        )
+
+    with gzip.open(path, "rt", encoding="utf-8") as fh:
+        payload = json.load(fh)
+
+    if not isinstance(payload, dict):
+        raise ValueError("Stored structure is invalid")
+
+    pages = payload.get("pages")
+    elements = payload.get("elements")
+
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("Stored structure.pages must be a non-empty array")
+    if not isinstance(elements, list):
+        raise ValueError("Stored structure.elements must be an array")
+
+    return payload
+
+
+# ============================================================
 # EXTRACT PDF ROUTE
 # ============================================================
 
@@ -3141,15 +3248,12 @@ def extract_pdf():
             document
         )
 
-        # Serialize the exact extracted structure once here.
-        # Make.com can pass this string directly to /create-docx without
-        # rebuilding nested pages/elements arrays or re-extracting the PDF.
-        structure_json = json.dumps(
-            {
-                "pages": pages,
-                "elements": elements,
-            },
-            ensure_ascii=False,
+        # Store the exact extraction result server-side. Make.com only needs
+        # to carry the small structure_id between /extract-pdf and /create-docx.
+        structure_id = save_extracted_structure(
+            pages,
+            elements,
+            uploaded_file.filename,
         )
 
         return jsonify({
@@ -3197,9 +3301,8 @@ def extract_pdf():
                 page["rectangle_count"]
                 for page in pages
             ),
-            "pages": pages,
-            "elements": elements,
-            "structure_json": structure_json,
+            "structure_id": structure_id,
+            "structure_ttl_seconds": STRUCTURE_TTL_SECONDS,
             "chunks": chunks,
         })
 
@@ -3213,21 +3316,18 @@ def extract_pdf():
 @app.route("/create-docx", methods=["POST"])
 def create_docx():
     translations_raw = request.form.get("translations")
-    structure_raw = request.form.get("structure")
+    structure_id = (request.form.get("structure_id") or "").strip()
 
     if not translations_raw:
         return jsonify({
             "error": "No translations JSON received"
         }), 400
 
-    if not structure_raw:
+    if not structure_id:
         return jsonify({
-            "error": "No extracted structure JSON received",
+            "error": "No structure_id received",
             "expected": {
-                "structure": {
-                    "pages": "pages[] from /extract-pdf",
-                    "elements": "elements[] from /extract-pdf"
-                }
+                "structure_id": "structure_id returned by /extract-pdf"
             }
         }), 400
 
@@ -3245,17 +3345,9 @@ def create_docx():
         }), 400
 
     try:
-        structure = json.loads(structure_raw)
-        if not isinstance(structure, dict):
-            raise ValueError("structure must be a JSON object")
-
-        pages = structure.get("pages")
-        elements = structure.get("elements")
-
-        if not isinstance(pages, list) or not pages:
-            raise ValueError("structure.pages must be a non-empty array")
-        if not isinstance(elements, list):
-            raise ValueError("structure.elements must be an array")
+        stored_structure = load_extracted_structure(structure_id)
+        pages = stored_structure["pages"]
+        elements = stored_structure["elements"]
 
         # Defensive validation: every renderable extracted element should keep
         # the deterministic ID assigned by /extract-pdf.
@@ -3273,13 +3365,18 @@ def create_docx():
 
         if duplicate_ids:
             raise ValueError(
-                "Duplicate element IDs in supplied structure: "
+                "Duplicate element IDs in stored structure: "
                 + ", ".join(duplicate_ids[:20])
             )
 
+    except FileNotFoundError as e:
+        return jsonify({
+            "error": "Stored PDF structure not found",
+            "details": str(e),
+        }), 410
     except Exception as e:
         return jsonify({
-            "error": "Could not parse extracted structure JSON",
+            "error": "Could not load stored PDF structure",
             "details": str(e),
         }), 400
 
@@ -3297,7 +3394,11 @@ def create_docx():
 
     # The original PDF is intentionally NOT required here. A filename can be
     # supplied separately by Make; otherwise use a safe default.
-    original_name = request.form.get("filename") or "translated.pdf"
+    original_name = (
+        request.form.get("filename")
+        or stored_structure.get("filename")
+        or "translated.pdf"
+    )
 
     if original_name.lower().endswith(".pdf"):
         original_name = original_name[:-4]
