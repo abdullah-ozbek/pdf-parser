@@ -69,6 +69,16 @@ FORM_DOCX_ROW_GAP_MAX_PT = 10.0
 FORM_DOCX_LEFT_RIGHT_SAFETY_PT = 3.0
 FORM_DOCX_MIN_CELL_WIDTH_PT = 24.0
 
+# Footer detection
+ENABLE_FOOTER_DETECTION = True
+FOOTER_REGION_START_RATIO = 0.82
+FOOTER_HARD_REGION_START_RATIO = 0.93
+FOOTER_REPEAT_MIN_PAGES = 2
+FOOTER_PAGE_MARKER_REGEX = re.compile(
+    r"\b(seite|sayfa|page|stand|version|sürüm|tarih|datum)\b",
+    re.IGNORECASE,
+)
+
 # ============================================================
 # ROOT
 # ============================================================
@@ -1014,6 +1024,115 @@ def detect_span_underlines(spans, horizontal_lines):
                 span["underline"] = True
                 break
 
+
+# ============================================================
+# FOOTER DETECTION
+# ============================================================
+
+def normalize_footer_signature(text):
+    text = clean_text(text).lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def normalize_footer_relaxed_signature(text):
+    text = normalize_footer_signature(text)
+
+    # Page/date style footer text can differ only by page number/date.
+    if FOOTER_PAGE_MARKER_REGEX.search(text):
+        text = re.sub(r"\d+", "#", text)
+
+    return text
+
+
+def build_footer_signature_sets(document):
+    if not ENABLE_FOOTER_DETECTION:
+        return set(), set()
+
+    exact_pages = {}
+    relaxed_pages = {}
+
+    for page_index in range(len(document)):
+        page = document[page_index]
+        page_height = float(page.rect.height)
+        raw_blocks = extract_raw_text_blocks(page)
+
+        for block in raw_blocks:
+            bbox = block.get("bbox", {})
+            y0 = float(bbox.get("y0", 0))
+
+            if y0 < page_height * FOOTER_REGION_START_RATIO:
+                continue
+
+            text = clean_text(block.get("text", ""))
+            if not text:
+                continue
+
+            exact = normalize_footer_signature(text)
+            relaxed = normalize_footer_relaxed_signature(text)
+
+            if exact:
+                exact_pages.setdefault(exact, set()).add(page_index)
+
+            if relaxed:
+                relaxed_pages.setdefault(relaxed, set()).add(page_index)
+
+    exact_repeated = {
+        signature
+        for signature, page_ids in exact_pages.items()
+        if len(page_ids) >= FOOTER_REPEAT_MIN_PAGES
+    }
+
+    relaxed_repeated = {
+        signature
+        for signature, page_ids in relaxed_pages.items()
+        if len(page_ids) >= FOOTER_REPEAT_MIN_PAGES
+    }
+
+    return exact_repeated, relaxed_repeated
+
+
+def block_is_footer(
+    block,
+    page_height,
+    exact_footer_signatures,
+    relaxed_footer_signatures,
+):
+    if not ENABLE_FOOTER_DETECTION:
+        return False
+
+    bbox = block.get("bbox", {})
+    y0 = float(bbox.get("y0", 0))
+    y1 = float(bbox.get("y1", y0))
+
+    # Never classify upper-page content as footer.
+    if y0 < page_height * FOOTER_REGION_START_RATIO:
+        return False
+
+    text = clean_text(block.get("text", ""))
+    if not text:
+        return False
+
+    exact = normalize_footer_signature(text)
+    relaxed = normalize_footer_relaxed_signature(text)
+
+    if exact in exact_footer_signatures:
+        return True
+
+    if relaxed in relaxed_footer_signatures:
+        return True
+
+    # Very bottom page markers are footer even if they appear on one page only.
+    hard_footer_zone = (
+        y0 >= page_height * FOOTER_HARD_REGION_START_RATIO
+        or y1 >= page_height * 0.97
+    )
+
+    if hard_footer_zone and FOOTER_PAGE_MARKER_REGEX.search(text):
+        return True
+
+    return False
+
 # ============================================================
 # MAIN EXTRACTION
 # ============================================================
@@ -1021,6 +1140,10 @@ def detect_span_underlines(spans, horizontal_lines):
 def extract_pdf_structure(document):
     pages = []
     elements = []
+
+    exact_footer_signatures, relaxed_footer_signatures = (
+        build_footer_signature_sets(document)
+    )
 
     element_counter = 1
     table_counter = 1
@@ -1180,6 +1303,7 @@ def extract_pdf_structure(document):
             table_structures.append(table_data)
 
         text_elements = []
+        footer_elements = []
         detected_lists = []
 
         for block in raw_blocks:
@@ -1207,8 +1331,33 @@ def extract_pdf_structure(document):
             if not text:
                 continue
 
+            is_footer = block_is_footer(
+                block,
+                page_height,
+                exact_footer_signatures,
+                relaxed_footer_signatures,
+            )
+
             element_id = f"pdf_{element_counter}"
             element_counter += 1
+
+            if is_footer:
+                element = {
+                    "id": element_id,
+                    "page": page_number,
+                    "type": "footer",
+                    "text": text,
+                    "bbox": block["bbox"],
+                    "role": "footer",
+                    "style": block.get("style", {}),
+                    "lines": block.get("lines", []),
+                    "spans": block.get("spans", []),
+                    "list": None,
+                }
+
+                elements.append(element)
+                footer_elements.append(element)
+                continue
 
             role = classify_text_role(
                 block,
@@ -1285,6 +1434,7 @@ def extract_pdf_structure(document):
             "column_count": columns["column_count"],
             "column_divider_x": columns["divider_x"],
             "text_block_count": len(text_elements),
+            "footer_block_count": len(footer_elements),
             "table_count": len(table_structures),
             "list_count": len(detected_lists),
             "drawing_count": len(drawings),
@@ -1305,6 +1455,7 @@ def extract_pdf_structure(document):
             "form_fields": form_fields,
             "form_rows": form_rows,
             "form_columns": form_columns,
+            "footer_blocks": footer_elements,
             "layout": layout_items,
         })
 
@@ -1804,6 +1955,7 @@ def add_basic_table(
 def page_is_form_page(page_data):
     return (
         ENABLE_FORM_DOCX_REBUILD
+        and page_data.get("table_count", 0) == 0
         and page_data.get("form_field_count", 0) >= FORM_PAGE_MIN_FIELDS
         and page_data.get("form_row_count", 0) >= FORM_PAGE_MIN_ROWS
     )
@@ -2273,6 +2425,72 @@ def add_form_page(
                 previous_y,
             )
 
+
+# ============================================================
+# WORD FOOTER
+# ============================================================
+
+def clear_footer(footer):
+    try:
+        for paragraph in list(footer.paragraphs):
+            paragraph._element.getparent().remove(paragraph._element)
+    except Exception:
+        pass
+
+
+def add_page_footer(
+    section,
+    page_data,
+    element_lookup,
+    translations,
+):
+    footer_items = page_data.get("footer_blocks", [])
+    if not footer_items:
+        return
+
+    footer = section.footer
+    footer.is_linked_to_previous = False
+    clear_footer(footer)
+
+    sorted_items = sorted(
+        footer_items,
+        key=lambda item: (
+            float(item.get("bbox", {}).get("y0", 0)),
+            float(item.get("bbox", {}).get("x0", 0)),
+        ),
+    )
+
+    for item in sorted_items:
+        element_id = item.get("id")
+        element = element_lookup.get(element_id, item)
+
+        text = translations.get(
+            element_id,
+            element.get("text", ""),
+        )
+
+        if not clean_text(text):
+            continue
+
+        paragraph = footer.add_paragraph()
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(0)
+        paragraph.paragraph_format.line_spacing = 1
+
+        bbox = element.get("bbox", {})
+        paragraph.paragraph_format.left_indent = Pt(
+            max(0, float(bbox.get("x0", 0)))
+        )
+
+        run = paragraph.add_run(text)
+        style = element.get("style", {})
+        run.font.name = style.get("font") or DEFAULT_FONT_NAME
+
+        size = float(style.get("size", 7.0) or 7.0)
+        run.font.size = Pt(clamp(size, 5.5, 8.5))
+        run.bold = bool(style.get("bold", False))
+        run.italic = bool(style.get("italic", False))
+
 # ============================================================
 # CREATE WORD
 # ============================================================
@@ -2327,6 +2545,13 @@ def create_word_from_pdf(
             section,
             page_width,
             page_height,
+        )
+
+        add_page_footer(
+            section,
+            page_data,
+            element_lookup,
+            translations,
         )
 
         page_number = int(
@@ -2486,6 +2711,10 @@ def extract_pdf():
             ),
             "form_row_count": sum(
                 page["form_row_count"]
+                for page in pages
+            ),
+            "footer_block_count": sum(
+                page.get("footer_block_count", 0)
                 for page in pages
             ),
             "rectangle_count": sum(
