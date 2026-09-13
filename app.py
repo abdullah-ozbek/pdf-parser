@@ -5,6 +5,17 @@ import fitz
 app = Flask(__name__)
 
 
+# ============================================================
+# CONFIG
+# ============================================================
+
+CHUNK_SIZE = 40
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
 @app.route("/", methods=["GET"])
 def home():
     return {
@@ -13,8 +24,16 @@ def home():
     }
 
 
+# ============================================================
+# EXTRACT PDF
+# ============================================================
+
 @app.route("/extract-pdf", methods=["POST"])
 def extract_pdf():
+
+    # --------------------------------------------------------
+    # FILE CHECK
+    # --------------------------------------------------------
 
     if "file" not in request.files:
         return jsonify({
@@ -22,6 +41,10 @@ def extract_pdf():
         }), 400
 
     uploaded_file = request.files["file"]
+
+    # --------------------------------------------------------
+    # OPEN PDF
+    # --------------------------------------------------------
 
     try:
         pdf_bytes = uploaded_file.read()
@@ -37,16 +60,27 @@ def extract_pdf():
             "details": str(e)
         }), 400
 
+    # --------------------------------------------------------
+    # EXTRACT DATA
+    # --------------------------------------------------------
+
     pages = []
     elements = []
 
     element_counter = 1
 
-    for page_index in range(len(document)):
+    for page_index in range(
+        len(document)
+    ):
 
-        page = document[page_index]
+        page = document[
+            page_index
+        ]
 
-        blocks = page.get_text("blocks")
+        # PyMuPDF text blocks
+        blocks = page.get_text(
+            "blocks"
+        )
 
         page_elements = []
 
@@ -59,6 +93,7 @@ def extract_pdf():
             y0 = block[1]
             x1 = block[2]
             y1 = block[3]
+
             text = block[4].strip()
 
             if not text:
@@ -70,37 +105,100 @@ def extract_pdf():
                 "type": "text_block",
                 "text": text,
                 "bbox": {
-                    "x0": round(x0, 2),
-                    "y0": round(y0, 2),
-                    "x1": round(x1, 2),
-                    "y1": round(y1, 2)
+                    "x0": round(
+                        x0,
+                        2
+                    ),
+                    "y0": round(
+                        y0,
+                        2
+                    ),
+                    "x1": round(
+                        x1,
+                        2
+                    ),
+                    "y1": round(
+                        y1,
+                        2
+                    )
                 }
             }
 
-            elements.append(element)
-            page_elements.append(element)
+            elements.append(
+                element
+            )
+
+            page_elements.append(
+                element
+            )
 
             element_counter += 1
 
         pages.append({
             "page": page_index + 1,
-            "width": round(page.rect.width, 2),
-            "height": round(page.rect.height, 2),
-            "element_count": len(page_elements),
+            "width": round(
+                page.rect.width,
+                2
+            ),
+            "height": round(
+                page.rect.height,
+                2
+            ),
+            "element_count": len(
+                page_elements
+            ),
             "elements": page_elements
         })
 
     document.close()
 
+    # --------------------------------------------------------
+    # CREATE CHUNKS
+    # --------------------------------------------------------
+
+    chunks = [
+        elements[i:i + CHUNK_SIZE]
+        for i in range(
+            0,
+            len(elements),
+            CHUNK_SIZE
+        )
+    ]
+
+    # --------------------------------------------------------
+    # RESPONSE
+    # --------------------------------------------------------
+
     return jsonify({
-        "filename": uploaded_file.filename,
-        "page_count": len(pages),
-        "element_count": len(elements),
-        "pages": pages,
-        "elements": elements
+        "filename":
+            uploaded_file.filename,
+
+        "page_count":
+            len(pages),
+
+        "element_count":
+            len(elements),
+
+        "chunk_size":
+            CHUNK_SIZE,
+
+        "chunk_count":
+            len(chunks),
+
+        "pages":
+            pages,
+
+        "elements":
+            elements,
+
+        "chunks":
+            chunks
     })
 
 
+# ============================================================
+# LOCAL
+# ============================================================
 
 if __name__ == "__main__":
     app.run()
