@@ -2912,13 +2912,20 @@ def add_page_footer(
 # CREATE WORD
 # ============================================================
 
-def create_word_from_pdf(
-    pdf_document,
+def create_word_from_structure(
+    pages,
+    elements,
     translations,
 ):
-    pages, elements, _ = extract_pdf_structure(
-        pdf_document
-    )
+    # IMPORTANT: /create-docx must render the exact structure returned by
+    # /extract-pdf. It must never open/re-extract the original PDF here.
+    # This keeps pdf_N IDs, form fields, tables, header/footer classification
+    # and spatial de-duplication identical between translation and rendering.
+    if not isinstance(pages, list) or not pages:
+        raise ValueError("Structure pages[] is missing or empty")
+
+    if not isinstance(elements, list):
+        raise ValueError("Structure elements[] is missing")
 
     document = Document()
 
@@ -3193,26 +3200,27 @@ def extract_pdf():
 
 @app.route("/create-docx", methods=["POST"])
 def create_docx():
-    if "file" not in request.files:
-        return jsonify({
-            "error": "No PDF file received"
-        }), 400
-
-    uploaded_file = request.files["file"]
-
-    translations_raw = request.form.get(
-        "translations"
-    )
+    translations_raw = request.form.get("translations")
+    structure_raw = request.form.get("structure")
 
     if not translations_raw:
         return jsonify({
             "error": "No translations JSON received"
         }), 400
 
+    if not structure_raw:
+        return jsonify({
+            "error": "No extracted structure JSON received",
+            "expected": {
+                "structure": {
+                    "pages": "pages[] from /extract-pdf",
+                    "elements": "elements[] from /extract-pdf"
+                }
+            }
+        }), 400
+
     try:
-        translations = parse_translations(
-            translations_raw
-        )
+        translations = parse_translations(translations_raw)
     except Exception as e:
         return jsonify({
             "error": "Could not parse translations JSON",
@@ -3225,47 +3233,64 @@ def create_docx():
         }), 400
 
     try:
-        pdf_bytes = uploaded_file.read()
+        structure = json.loads(structure_raw)
+        if not isinstance(structure, dict):
+            raise ValueError("structure must be a JSON object")
 
-        pdf_document = fitz.open(
-            stream=pdf_bytes,
-            filetype="pdf",
-        )
+        pages = structure.get("pages")
+        elements = structure.get("elements")
+
+        if not isinstance(pages, list) or not pages:
+            raise ValueError("structure.pages must be a non-empty array")
+        if not isinstance(elements, list):
+            raise ValueError("structure.elements must be an array")
+
+        # Defensive validation: every renderable extracted element should keep
+        # the deterministic ID assigned by /extract-pdf.
+        seen_ids = set()
+        duplicate_ids = []
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            element_id = element.get("id")
+            if not element_id:
+                continue
+            if element_id in seen_ids:
+                duplicate_ids.append(element_id)
+            seen_ids.add(element_id)
+
+        if duplicate_ids:
+            raise ValueError(
+                "Duplicate element IDs in supplied structure: "
+                + ", ".join(duplicate_ids[:20])
+            )
 
     except Exception as e:
         return jsonify({
-            "error": "Could not read original PDF",
+            "error": "Could not parse extracted structure JSON",
             "details": str(e),
         }), 400
 
     try:
-        word_file = create_word_from_pdf(
-            pdf_document,
+        word_file = create_word_from_structure(
+            pages,
+            elements,
             translations,
         )
-
     except Exception as e:
         return jsonify({
             "error": "Could not create DOCX",
             "details": str(e),
         }), 500
 
-    finally:
-        pdf_document.close()
+    # The original PDF is intentionally NOT required here. A filename can be
+    # supplied separately by Make; otherwise use a safe default.
+    original_name = request.form.get("filename") or "translated.pdf"
 
-    original_name = (
-        uploaded_file.filename
-        or "translated.pdf"
-    )
-
-    if original_name.lower().endswith(
-        ".pdf"
-    ):
+    if original_name.lower().endswith(".pdf"):
         original_name = original_name[:-4]
 
-    output_filename = (
-        f"{original_name}_translated.docx"
-    )
+    output_filename = f"{original_name}_translated.docx"
 
     return send_file(
         word_file,
