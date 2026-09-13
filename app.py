@@ -1261,6 +1261,125 @@ def extract_raw_text_blocks(page):
 
     return blocks_out
 
+def split_block_into_layout_segments(block):
+    """
+    Split a PDF text block into visually homogeneous layout segments.
+
+    PyMuPDF often groups a bold heading and the following normal body text
+    into the same text block.  Rendering the whole translated block with the
+    block-level style makes every line bold and also removes the visual gap
+    between headings and paragraphs.
+
+    We therefore split only for normal document layout, at line boundaries,
+    when either the visual style changes or the source contains a paragraph-
+    sized vertical gap.  Form extraction continues to use the original raw
+    blocks, so form-label matching is unaffected.
+    """
+    lines = [
+        line for line in (block.get("lines", []) or [])
+        if clean_text(line.get("text", ""))
+    ]
+
+    if len(lines) <= 1:
+        return [block]
+
+    def line_style(line):
+        spans = line.get("spans", []) or []
+        return get_block_style(spans)
+
+    def same_style(a, b):
+        # Bold/italic changes are semantically important and must always split.
+        if bool(a.get("bold", False)) != bool(b.get("bold", False)):
+            return False
+        if bool(a.get("italic", False)) != bool(b.get("italic", False)):
+            return False
+
+        # Keep font-family and color changes separate as well.
+        if str(a.get("font", "")) != str(b.get("font", "")):
+            return False
+        if str(a.get("color", "#000000")) != str(b.get("color", "#000000")):
+            return False
+
+        try:
+            if abs(float(a.get("size", 0) or 0) - float(b.get("size", 0) or 0)) > 0.6:
+                return False
+        except Exception:
+            pass
+
+        return True
+
+    groups = []
+    current = []
+    current_style = None
+    previous_line = None
+
+    for line in lines:
+        style = line_style(line)
+        split_here = False
+
+        if current:
+            if not same_style(current_style, style):
+                split_here = True
+            else:
+                prev_bbox = (previous_line or {}).get("bbox", {})
+                bbox = line.get("bbox", {})
+                prev_y1 = float(prev_bbox.get("y1", 0) or 0)
+                y0 = float(bbox.get("y0", prev_y1) or prev_y1)
+                gap = y0 - prev_y1
+
+                # Normal wrapped lines usually have only a 1-4 pt inter-line
+                # gap.  A larger gap indicates a real paragraph break even if
+                # the font styling is unchanged.
+                prev_height = max(1.0, float(prev_bbox.get("y1", 0) or 0) - float(prev_bbox.get("y0", 0) or 0))
+                paragraph_gap_threshold = max(6.0, prev_height * 0.55)
+                if gap > paragraph_gap_threshold:
+                    split_here = True
+
+        if split_here:
+            groups.append(current)
+            current = []
+
+        if not current:
+            current_style = style
+
+        current.append(line)
+        previous_line = line
+
+    if current:
+        groups.append(current)
+
+    if len(groups) <= 1:
+        return [block]
+
+    segments = []
+    for group in groups:
+        spans = [
+            span
+            for line in group
+            for span in (line.get("spans", []) or [])
+            if clean_text(span.get("text", ""))
+        ]
+        if not spans:
+            continue
+
+        x0 = min(float(line.get("bbox", {}).get("x0", 0)) for line in group)
+        y0 = min(float(line.get("bbox", {}).get("y0", 0)) for line in group)
+        x1 = max(float(line.get("bbox", {}).get("x1", 0)) for line in group)
+        y1 = max(float(line.get("bbox", {}).get("y1", 0)) for line in group)
+
+        segment = {
+            "text": "\n".join(clean_text(line.get("text", "")) for line in group).strip(),
+            "bbox": {"x0": x0, "y0": y0, "x1": x1, "y1": y1},
+            "lines": group,
+            "spans": spans,
+            "style": get_block_style(spans),
+        }
+        if segment["text"]:
+            segments.append(segment)
+
+    return segments or [block]
+
+
 # ============================================================
 # FONT STATS / HEADINGS
 # ============================================================
@@ -2158,10 +2277,9 @@ def extract_pdf_structure(document):
                 )
             )
 
-            element_id = f"pdf_{element_counter}"
-            element_counter += 1
-
             if is_footer:
+                element_id = f"pdf_{element_counter}"
+                element_counter += 1
                 element = {
                     "id": element_id,
                     "page": page_number,
@@ -2180,6 +2298,8 @@ def extract_pdf_structure(document):
                 continue
 
             if is_header:
+                element_id = f"pdf_{element_counter}"
+                element_counter += 1
                 element = {
                     "id": element_id,
                     "page": page_number,
@@ -2196,42 +2316,54 @@ def extract_pdf_structure(document):
                 header_elements.append(element)
                 continue
 
-            role = classify_text_role(
-                block,
-                font_stats,
-            )
+            # PyMuPDF may place a bold heading and the following normal body
+            # text in one text block. Split that block only for normal layout
+            # rendering so each translated segment keeps its own style and the
+            # original vertical paragraph spacing.
+            for layout_block in split_block_into_layout_segments(block):
+                layout_text = clean_text(layout_block.get("text", ""))
+                if not layout_text:
+                    continue
 
-            list_info = detect_list_info(text)
-            element_type = (
-                "list_item"
-                if list_info
-                else "text_block"
-            )
+                element_id = f"pdf_{element_counter}"
+                element_counter += 1
 
-            element = {
-                "id": element_id,
-                "page": page_number,
-                "type": element_type,
-                "text": text,
-                "bbox": block["bbox"],
-                "role": role,
-                "style": block.get("style", {}),
-                "lines": block.get("lines", []),
-                "spans": block.get("spans", []),
-                "list": list_info,
-            }
+                role = classify_text_role(
+                    layout_block,
+                    font_stats,
+                )
 
-            elements.append(element)
-            text_elements.append(element)
+                list_info = detect_list_info(layout_text)
+                element_type = (
+                    "list_item"
+                    if list_info
+                    else "text_block"
+                )
 
-            if list_info:
-                detected_lists.append({
+                element = {
                     "id": element_id,
-                    "bbox": block["bbox"],
-                    "list_type": list_info["list_type"],
-                    "marker": list_info["marker"],
-                    "text": text,
-                })
+                    "page": page_number,
+                    "type": element_type,
+                    "text": layout_text,
+                    "bbox": layout_block["bbox"],
+                    "role": role,
+                    "style": layout_block.get("style", {}),
+                    "lines": layout_block.get("lines", []),
+                    "spans": layout_block.get("spans", []),
+                    "list": list_info,
+                }
+
+                elements.append(element)
+                text_elements.append(element)
+
+                if list_info:
+                    detected_lists.append({
+                        "id": element_id,
+                        "bbox": layout_block["bbox"],
+                        "list_type": list_info["list_type"],
+                        "marker": list_info["marker"],
+                        "text": layout_text,
+                    })
 
         # Create independent translation ids for visual form-label lines.
         # They are not rendered as normal text elements; add_form_row() uses
