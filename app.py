@@ -764,9 +764,16 @@ def find_form_label(field_line, raw_blocks):
             ):
                 continue
 
+            # Form labels are usually aligned to the left edge of their
+            # writing field.  Center-distance heavily penalises short labels
+            # such as "Ort" / "City" and can make the matcher incorrectly
+            # reuse a longer label from the previous row.  Prefer vertical
+            # proximity + left-edge alignment, with only a small centre term.
+            left_distance = abs(fx0 - bx0)
             score = (
-                abs(vertical_distance) * 4
-                + center_distance
+                abs(vertical_distance) * 6
+                + left_distance * 0.8
+                + center_distance * 0.10
                 - overlap_ratio * 20
             )
 
@@ -1590,6 +1597,176 @@ def block_is_header(block, page_height, repeated_header_signatures):
 
     return False
 
+
+def bbox_similarity_score(a, b):
+    """Return a geometry-only similarity score for two bbox dictionaries."""
+    if not a or not b:
+        return 0.0
+    ra = (
+        float(a.get("x0", 0)), float(a.get("y0", 0)),
+        float(a.get("x1", 0)), float(a.get("y1", 0)),
+    )
+    rb = (
+        float(b.get("x0", 0)), float(b.get("y0", 0)),
+        float(b.get("x1", 0)), float(b.get("y1", 0)),
+    )
+    overlap = bbox_overlap_ratio(ra, rb)
+    _, containment = _rect_metrics(ra, rb)
+    return max(overlap, containment)
+
+
+def attach_form_label_translation_elements(
+    form_fields,
+    raw_blocks,
+    elements,
+    element_counter,
+    page_number,
+):
+    """Give every reconstructed form-label line its own translation id.
+
+    PDF text blocks often contain several labels in one block.  Asking the
+    translator to preserve the original internal line breaks is fragile: a
+    six-line block can come back as four or five translated lines, causing
+    labels to be assigned to the wrong form fields.  Here each visual label
+    line becomes an independent translation element.  This is generic and is
+    driven only by bbox geometry.
+
+    Small helper lines directly underneath a primary label and inside the same
+    field column are attached to that field as well (for example explanatory
+    parenthetical text beneath a date field).
+    """
+    line_records = []
+    for block_index, block in enumerate(raw_blocks):
+        for line_index, line in enumerate(block.get("lines", []) or []):
+            text = clean_text(line.get("text", ""))
+            if not text:
+                text = clean_text("".join(
+                    span.get("text", "")
+                    for span in (line.get("spans", []) or [])
+                ))
+            if not text:
+                continue
+            line_records.append({
+                "block_index": block_index,
+                "line_index": line_index,
+                "line": line,
+                "text": text,
+                "bbox": line.get("bbox") or block.get("bbox", {}),
+                "style": block.get("style", {}),
+            })
+
+    id_cache = {}
+
+    def translation_id_for(record, role):
+        nonlocal element_counter
+        bbox = record.get("bbox", {})
+        key = (
+            page_number,
+            round(float(bbox.get("x0", 0)), 2),
+            round(float(bbox.get("y0", 0)), 2),
+            round(float(bbox.get("x1", 0)), 2),
+            round(float(bbox.get("y1", 0)), 2),
+            record.get("text", ""),
+        )
+        if key in id_cache:
+            return id_cache[key]
+
+        element_id = f"pdf_{element_counter}"
+        element_counter += 1
+        elements.append({
+            "id": element_id,
+            "page": page_number,
+            "type": "form_label_line",
+            "text": record.get("text", ""),
+            "bbox": bbox,
+            "role": role,
+            "style": record.get("style", {}),
+            "lines": [record.get("line", {})],
+            "spans": (record.get("line", {}) or {}).get("spans", []),
+            "list": None,
+        })
+        id_cache[key] = element_id
+        return element_id
+
+    for field in form_fields:
+        label_bbox = field.get("label_bbox")
+        if not label_bbox:
+            continue
+
+        primary = None
+        primary_score = 0.0
+        for record in line_records:
+            score = bbox_similarity_score(record.get("bbox"), label_bbox)
+            if score > primary_score:
+                primary_score = score
+                primary = record
+
+        if primary is None or primary_score < 0.70:
+            continue
+
+        field["label_translation_id"] = translation_id_for(
+            primary, "form_field_label"
+        )
+        field["label_translation_source"] = primary.get("text", "")
+
+        # Find explanatory/helper lines immediately below the primary label,
+        # within the same field's horizontal span.  We do not rely on words or
+        # language, only local geometry and visual hierarchy.
+        px0 = float(field.get("x0", 0))
+        px1 = float(field.get("x1", 0))
+        pb = primary.get("bbox", {})
+        py1 = float(pb.get("y1", 0))
+        primary_block = primary.get("block_index")
+
+        helpers = []
+        for record in line_records:
+            if record is primary:
+                continue
+            if record.get("block_index") != primary_block:
+                continue
+
+            bbox = record.get("bbox", {})
+            by0 = float(bbox.get("y0", 0))
+            bx0 = float(bbox.get("x0", 0))
+            bx1 = float(bbox.get("x1", 0))
+
+            vertical_gap = by0 - py1
+            if vertical_gap < -2.0 or vertical_gap > 4.5:
+                continue
+
+            overlap = horizontal_overlap(px0 - 4.0, px1 + 4.0, bx0, bx1)
+            line_width = max(1.0, bx1 - bx0)
+            if overlap / line_width < 0.72:
+                continue
+
+            # Section headings are structural text and must remain separate.
+            if line_is_form_section_heading(record.get("line", {})):
+                continue
+
+            # A helper normally starts close to the same left edge as its
+            # primary label.  This prevents a neighbouring column's label from
+            # being attached to the current field.
+            if abs(bx0 - float(pb.get("x0", bx0))) > 12.0:
+                continue
+
+            helpers.append(record)
+
+        helpers.sort(key=lambda r: (
+            float(r.get("bbox", {}).get("y0", 0)),
+            float(r.get("bbox", {}).get("x0", 0)),
+        ))
+
+        field["label_helper_translation_ids"] = [
+            translation_id_for(record, "form_field_helper")
+            for record in helpers
+        ]
+        field["label_helper_sources"] = [
+            record.get("text", "") for record in helpers
+        ]
+
+    return element_counter
+
+
 # ============================================================
 # MAIN EXTRACTION
 # ============================================================
@@ -1882,6 +2059,22 @@ def extract_pdf_structure(document):
                     "marker": list_info["marker"],
                     "text": text,
                 })
+
+        # Create independent translation ids for visual form-label lines.
+        # They are not rendered as normal text elements; add_form_row() uses
+        # them directly so translation line wrapping cannot scramble fields.
+        if (
+            len(form_fields) >= FORM_PAGE_MIN_FIELDS
+            and len(form_rows) >= FORM_PAGE_MIN_ROWS
+            and len(form_columns) >= 2
+        ):
+            element_counter = attach_form_label_translation_elements(
+                form_fields,
+                raw_blocks,
+                elements,
+                element_counter,
+                page_number,
+            )
 
         columns = detect_columns(
             raw_blocks,
@@ -2967,36 +3160,60 @@ def add_form_row(
             end=20,
         )
 
-        # Match the visual label line to the translated source element.
-        label_match = find_best_form_label_element(
-            field,
-            page_elements,
-            claimed_label_keys,
-        )
-
+        # Prefer the independent line-level translation id created during
+        # extraction.  This prevents a translator from reflowing a multi-line
+        # PDF block and shifting labels to neighbouring form fields.
         label = ""
-        if label_match is not None:
-            label_element = label_match["element"]
-            label_id = label_element.get("id")
-            line_index = label_match.get("line_index")
+        helper_labels = []
+        direct_label_id = field.get("label_translation_id")
 
-            translated_block = clean_text(
-                translations.get(label_id, label_element.get("text", ""))
+        if direct_label_id:
+            label = clean_text(translations.get(
+                direct_label_id,
+                field.get("label_translation_source", field.get("label", "")),
+            ))
+            rendered_ids.add(direct_label_id)
+
+            helper_ids = field.get("label_helper_translation_ids", []) or []
+            helper_sources = field.get("label_helper_sources", []) or []
+            for helper_index, helper_id in enumerate(helper_ids):
+                source = (
+                    helper_sources[helper_index]
+                    if helper_index < len(helper_sources)
+                    else ""
+                )
+                helper_text = clean_text(translations.get(helper_id, source))
+                if helper_text:
+                    helper_labels.append(helper_text)
+                rendered_ids.add(helper_id)
+        else:
+            label_match = find_best_form_label_element(
+                field,
+                page_elements,
+                claimed_label_keys,
             )
-            translated_lines = [
-                clean_text(part)
-                for part in translated_block.splitlines()
-                if clean_text(part)
-            ]
+            if label_match is not None:
+                label_element = label_match["element"]
+                label_id = label_element.get("id")
+                line_index = label_match.get("line_index")
 
-            if line_index is not None and 0 <= int(line_index) < len(translated_lines):
-                label = translated_lines[int(line_index)]
-            elif len(translated_lines) == 1:
-                label = translated_lines[0]
+                translated_block = clean_text(
+                    translations.get(label_id, label_element.get("text", ""))
+                )
+                translated_lines = [
+                    clean_text(part)
+                    for part in translated_block.splitlines()
+                    if clean_text(part)
+                ]
 
-            claimed_label_keys.add(label_match["claim_key"])
-            if label_id:
-                rendered_ids.add(label_id)
+                if line_index is not None and 0 <= int(line_index) < len(translated_lines):
+                    label = translated_lines[int(line_index)]
+                elif len(translated_lines) == 1:
+                    label = translated_lines[0]
+
+                claimed_label_keys.add(label_match["claim_key"])
+                if label_id:
+                    rendered_ids.add(label_id)
 
         # Remove the default paragraph content and rebuild the field according
         # to the detected PDF geometry. This is intentionally generic: labels
@@ -3016,6 +3233,19 @@ def add_form_row(
             run.font.name = DEFAULT_FONT_NAME
             run.font.size = Pt(FORM_DOCX_FONT_PT)
             apply_hex_font_color(run, field.get("label_color", "#000000"))
+
+            # Explanatory text that visually belongs to the same PDF field is
+            # kept directly with the field label instead of being emitted as
+            # an unrelated paragraph elsewhere on the page.
+            for helper_text in helper_labels:
+                helper_p = p._parent.add_paragraph()
+                _configure(helper_p)
+                helper_run = helper_p.add_run(helper_text)
+                helper_run.font.name = DEFAULT_FONT_NAME
+                helper_run.font.size = Pt(max(6.5, FORM_DOCX_FONT_PT - 0.5))
+                apply_hex_font_color(
+                    helper_run, field.get("label_color", "#000000")
+                )
 
         def _add_writing_line(p):
             _configure(p, blank=True)
