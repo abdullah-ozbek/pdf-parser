@@ -1261,7 +1261,7 @@ def extract_raw_text_blocks(page):
 
     return blocks_out
 
-def split_block_into_layout_segments(block):
+def split_block_into_layout_segments(block, column_divider_x=None, page_width=None):
     """
     Split a PDF text block into visually homogeneous layout segments.
 
@@ -1287,6 +1287,19 @@ def split_block_into_layout_segments(block):
         spans = line.get("spans", []) or []
         return get_block_style(spans)
 
+    def line_column(line):
+        if column_divider_x is None or not page_width:
+            return "single"
+        bbox = line.get("bbox", {}) or {}
+        x0 = float(bbox.get("x0", 0) or 0)
+        x1 = float(bbox.get("x1", 0) or 0)
+        tolerance = max(8.0, float(page_width) * 0.015)
+        if x1 <= float(column_divider_x) + tolerance and x0 < float(column_divider_x):
+            return "left"
+        if x0 >= float(column_divider_x) - tolerance and x1 > float(column_divider_x):
+            return "right"
+        return "full"
+
     def same_style(a, b):
         # Bold/italic changes are semantically important and must always split.
         if bool(a.get("bold", False)) != bool(b.get("bold", False)):
@@ -1311,14 +1324,18 @@ def split_block_into_layout_segments(block):
     groups = []
     current = []
     current_style = None
+    current_column = None
     previous_line = None
 
     for line in lines:
         style = line_style(line)
+        column = line_column(line)
         split_here = False
 
         if current:
-            if not same_style(current_style, style):
+            if column != current_column:
+                split_here = True
+            elif not same_style(current_style, style):
                 split_here = True
             else:
                 prev_bbox = (previous_line or {}).get("bbox", {})
@@ -1341,6 +1358,7 @@ def split_block_into_layout_segments(block):
 
         if not current:
             current_style = style
+            current_column = column
 
         current.append(line)
         previous_line = line
@@ -1443,52 +1461,85 @@ def classify_text_role(block, font_stats):
 # COLUMN DETECTION
 # ============================================================
 
-def detect_columns(blocks, page_width):
+def detect_columns(blocks, page_width, table_regions=None):
+    """Detect real two-column body layouts from individual PDF text lines.
+
+    Block-level detection is unreliable because PyMuPDF may merge both visual
+    columns into one text block.  We therefore classify *lines* by their
+    horizontal position, ignore lines inside tables, and require substantial
+    vertically-overlapping evidence on both sides of the page.
+    """
     if not ENABLE_COLUMN_DETECTION:
         return {"column_count": 1, "divider_x": None}
 
-    candidates = []
+    table_regions = table_regions or []
+    center = page_width / 2.0
+    left_lines = []
+    right_lines = []
+
+    def inside_table(bbox):
+        rect = (
+            float(bbox.get("x0", 0)), float(bbox.get("y0", 0)),
+            float(bbox.get("x1", 0)), float(bbox.get("y1", 0)),
+        )
+        return any(rect_center_inside(rect, t) for t in table_regions)
 
     for block in blocks:
-        bbox = block.get("bbox", {})
-        x0 = float(bbox.get("x0", 0))
-        x1 = float(bbox.get("x1", 0))
-        width = x1 - x0
+        for line in (block.get("lines", []) or []):
+            text = clean_text(line.get("text", ""))
+            bbox = line.get("bbox", {}) or {}
+            if not text or inside_table(bbox):
+                continue
 
-        if 10 < width < page_width * 0.70:
-            candidates.append((x0, x1))
+            x0 = float(bbox.get("x0", 0) or 0)
+            x1 = float(bbox.get("x1", 0) or 0)
+            y0 = float(bbox.get("y0", 0) or 0)
+            y1 = float(bbox.get("y1", 0) or 0)
+            width = max(0.0, x1 - x0)
 
-    if len(candidates) < COLUMN_MIN_BLOCKS * 2:
+            # A line that genuinely spans most of the page is a title / intro,
+            # not evidence for either column.
+            if width > page_width * 0.48:
+                continue
+
+            if x1 <= center + page_width * 0.025 and x0 < center * 0.92:
+                left_lines.append((x0, x1, y0, y1))
+            elif x0 >= center - page_width * 0.025 and x1 > center * 1.04:
+                right_lines.append((x0, x1, y0, y1))
+
+    # Real document columns should contain meaningful text on both sides.
+    min_lines = max(8, COLUMN_MIN_BLOCKS * 2)
+    if len(left_lines) < min_lines or len(right_lines) < min_lines:
         return {"column_count": 1, "divider_x": None}
 
-    center = page_width / 2
-
-    left = [item for item in candidates if item[0] < center]
-    right = [
-        item
-        for item in candidates
-        if item[0] >= center * 0.85
-    ]
-
-    if (
-        len(left) < COLUMN_MIN_BLOCKS
-        or len(right) < COLUMN_MIN_BLOCKS
-    ):
+    left_y0 = min(v[2] for v in left_lines)
+    left_y1 = max(v[3] for v in left_lines)
+    right_y0 = min(v[2] for v in right_lines)
+    right_y1 = max(v[3] for v in right_lines)
+    overlap = max(0.0, min(left_y1, right_y1) - max(left_y0, right_y0))
+    union = max(left_y1, right_y1) - min(left_y0, right_y0)
+    if union <= 0 or overlap / union < 0.28:
         return {"column_count": 1, "divider_x": None}
 
-    left_edge = statistics.median(item[1] for item in left)
-    right_edge = statistics.median(item[0] for item in right)
-    gap = right_edge - left_edge
+    # Use robust inner edges.  Percentiles avoid a single unusually long line
+    # destroying the gutter estimate.
+    left_edges = sorted(v[1] for v in left_lines)
+    right_edges = sorted(v[0] for v in right_lines)
+    left_inner = statistics.median(left_edges)
+    right_inner = statistics.median(right_edges)
+    gutter = right_inner - left_inner
 
-    if gap >= page_width * COLUMN_GAP_RATIO:
-        return {
-            "column_count": 2,
-            "divider_x": round_num(
-                (left_edge + right_edge) / 2
-            ),
-        }
+    if gutter < page_width * 0.025:
+        # Typical source files use a divider near the page center even when a
+        # few lines slightly intrude into the gutter.
+        divider = center
+    else:
+        divider = (left_inner + right_inner) / 2.0
 
-    return {"column_count": 1, "divider_x": None}
+    return {
+        "column_count": 2,
+        "divider_x": round_num(divider),
+    }
 
 # ============================================================
 # UNDERLINE DETECTION
@@ -2232,6 +2283,12 @@ def extract_pdf_structure(document):
             table_regions.append(table_bbox)
             table_structures.append(table_data)
 
+        columns = detect_columns(
+            raw_blocks,
+            page_width,
+            table_regions=table_regions,
+        )
+
         text_elements = []
         header_elements = []
         footer_elements = []
@@ -2320,7 +2377,11 @@ def extract_pdf_structure(document):
             # text in one text block. Split that block only for normal layout
             # rendering so each translated segment keeps its own style and the
             # original vertical paragraph spacing.
-            for layout_block in split_block_into_layout_segments(block):
+            for layout_block in split_block_into_layout_segments(
+                block,
+                column_divider_x=columns.get("divider_x") if columns.get("column_count") == 2 else None,
+                page_width=page_width,
+            ):
                 layout_text = clean_text(layout_block.get("text", ""))
                 if not layout_text:
                     continue
@@ -2381,11 +2442,6 @@ def extract_pdf_structure(document):
                 page_number,
             )
 
-        columns = detect_columns(
-            raw_blocks,
-            page_width,
-        )
-
         layout_items = []
 
         for element in text_elements:
@@ -2394,6 +2450,8 @@ def extract_pdf_structure(document):
                 "id": element["id"],
                 "x0": element["bbox"]["x0"],
                 "y0": element["bbox"]["y0"],
+                "x1": element["bbox"]["x1"],
+                "y1": element["bbox"]["y1"],
             })
 
         for table in table_structures:
@@ -2626,6 +2684,24 @@ def set_cell_border(
         )
 
 
+def set_table_borders_none(table):
+    try:
+        tbl_pr = table._tbl.tblPr
+        borders = tbl_pr.first_child_found_in("w:tblBorders")
+        if borders is None:
+            borders = OxmlElement("w:tblBorders")
+            tbl_pr.append(borders)
+        for edge in ["top", "left", "bottom", "right", "insideH", "insideV"]:
+            tag = f"w:{edge}"
+            border = borders.find(qn(tag))
+            if border is None:
+                border = OxmlElement(tag)
+                borders.append(border)
+            border.set(qn("w:val"), "nil")
+    except Exception:
+        pass
+
+
 def set_table_borders(table):
     try:
         tbl_pr = table._tbl.tblPr
@@ -2744,6 +2820,38 @@ def set_cell_width(cell, width_pt):
         pass
 
 
+def set_table_fixed_column_widths(table, widths_pt):
+    """Force exact Word table grid widths in twips."""
+    try:
+        table.autofit = False
+        try:
+            table.allow_autofit = False
+        except Exception:
+            pass
+
+        total_twips = int(round(sum(float(w) for w in widths_pt) * 20.0))
+        tbl_pr = table._tbl.tblPr
+        tbl_w = tbl_pr.first_child_found_in("w:tblW")
+        if tbl_w is None:
+            tbl_w = OxmlElement("w:tblW")
+            tbl_pr.append(tbl_w)
+        tbl_w.set(qn("w:w"), str(total_twips))
+        tbl_w.set(qn("w:type"), "dxa")
+
+        grid = table._tbl.tblGrid
+        cols = list(grid.gridCol_lst)
+        for i, width in enumerate(widths_pt):
+            width = float(width)
+            if i < len(table.columns):
+                table.columns[i].width = Pt(width)
+            if i < len(cols):
+                cols[i].set(qn("w:w"), str(int(round(width * 20.0))))
+            for cell in table.columns[i].cells:
+                set_cell_width(cell, width)
+    except Exception:
+        pass
+
+
 def remove_table_borders(table):
     try:
         tbl_pr = table._tbl.tblPr
@@ -2789,6 +2897,7 @@ def add_basic_text_block(
     translated_text,
     page_width,
     previous_bottom,
+    origin_x=0.0,
 ):
     bbox = element["bbox"]
 
@@ -2799,13 +2908,11 @@ def add_basic_text_block(
 
     paragraph = document.add_paragraph()
 
-    paragraph.paragraph_format.left_indent = Pt(
-        max(0, x0)
-    )
+    local_x0 = max(0.0, x0 - float(origin_x or 0.0))
+    local_x1 = max(local_x0, x1 - float(origin_x or 0.0))
 
-    paragraph.paragraph_format.right_indent = Pt(
-        max(0, page_width - x1)
-    )
+    paragraph.paragraph_format.left_indent = Pt(local_x0)
+    paragraph.paragraph_format.right_indent = Pt(max(0.0, page_width - local_x1))
 
     gap = y0 if previous_bottom is None else y0 - previous_bottom
 
@@ -3938,6 +4045,186 @@ def add_page_footer(
 # ============================================================
 # CREATE WORD
 # ============================================================
+# NORMAL TWO-COLUMN PAGE RENDERING
+# ============================================================
+
+def _layout_item_column(item, divider_x, page_width):
+    x0 = float(item.get("x0", 0) or 0)
+    x1 = float(item.get("x1", x0) or x0)
+    tolerance = max(8.0, float(page_width) * 0.015)
+    if x1 <= float(divider_x) + tolerance and x0 < float(divider_x):
+        return "left"
+    if x0 >= float(divider_x) - tolerance and x1 > float(divider_x):
+        return "right"
+    return "full"
+
+
+def _render_normal_item_stream(
+    container,
+    items,
+    element_lookup,
+    table_lookup,
+    translations,
+    rendered_ids,
+    width_pt,
+    origin_x=0.0,
+    initial_bottom=None,
+):
+    previous_bottom = initial_bottom
+    for item in items:
+        if item.get("type") == "table":
+            table_data = table_lookup.get(item.get("table_id"))
+            if not table_data:
+                continue
+            table_cell_ids = [
+                cell.get("id")
+                for row_data in table_data.get("rows", [])
+                for cell in row_data
+                if cell.get("id")
+            ]
+            if not table_cell_ids or not all(cid in rendered_ids for cid in table_cell_ids):
+                add_basic_table(container, table_data, translations)
+                rendered_ids.update(table_cell_ids)
+            previous_bottom = float(table_data.get("bbox", {}).get("y1", 0) or 0)
+            continue
+
+        element_id = item.get("id")
+        if not element_id or element_id in rendered_ids:
+            continue
+        element = element_lookup.get(element_id)
+        if not element:
+            continue
+        translated_text = translations.get(element_id, element.get("text", ""))
+        previous_bottom = add_basic_text_block(
+            container,
+            element,
+            translated_text,
+            width_pt,
+            previous_bottom,
+            origin_x=origin_x,
+        )
+        rendered_ids.add(element_id)
+
+
+def add_two_column_page(
+    document,
+    page_data,
+    element_lookup,
+    translations,
+    rendered_ids,
+):
+    """Render source two-column pages as two independent Word flows.
+
+    The old renderer sorted every block only by y/x and placed both columns in
+    one paragraph stream.  That creates large artificial blank areas whenever
+    the next source block belongs to the other column.  A borderless 1x2 table
+    gives each source column its own vertical flow, so only whitespace that
+    exists *inside that source column* is retained.
+    """
+    page_width = float(page_data.get("width", 0) or 0)
+    divider = float(page_data.get("column_divider_x") or (page_width / 2.0))
+    layout = list(page_data.get("layout", []) or [])
+    table_lookup = {t["table_id"]: t for t in page_data.get("tables", []) or []}
+
+    # Full-width material above the first real column content (page title,
+    # intro, etc.) remains in the normal document flow.
+    classified = []
+    first_column_y = None
+    for item in layout:
+        kind = _layout_item_column(item, divider, page_width)
+        classified.append((item, kind))
+        if kind in ("left", "right"):
+            y0 = float(item.get("y0", 0) or 0)
+            first_column_y = y0 if first_column_y is None else min(first_column_y, y0)
+
+    top_full = []
+    left_items = []
+    right_items = []
+    bottom_full = []
+    for item, kind in classified:
+        y0 = float(item.get("y0", 0) or 0)
+        if kind == "full":
+            if first_column_y is None or y0 < first_column_y - 2.0:
+                top_full.append(item)
+            else:
+                bottom_full.append(item)
+        elif kind == "left":
+            left_items.append(item)
+        else:
+            right_items.append(item)
+
+    _render_normal_item_stream(
+        document, top_full, element_lookup, table_lookup, translations,
+        rendered_ids, page_width, origin_x=0.0,
+    )
+
+    if left_items or right_items:
+        column_start_y = min(
+            [float(i.get("y0", 0) or 0) for i in (left_items + right_items)] or [0.0]
+        )
+        if top_full:
+            top_end_y = max(float(i.get("y1", i.get("y0", 0)) or 0) for i in top_full)
+            column_gap = max(0.0, column_start_y - top_end_y)
+        else:
+            column_gap = max(0.0, column_start_y)
+
+        # Position the two-column region at its source vertical location once.
+        # Do not repeat that absolute y offset inside each column cell.
+        if column_gap > 0.5:
+            spacer = document.add_paragraph()
+            spacer.paragraph_format.space_before = Pt(clamp(column_gap, 0, 160))
+            spacer.paragraph_format.space_after = Pt(0)
+            spacer.paragraph_format.line_spacing = Pt(0.1)
+            rr = spacer.add_run("")
+            rr.font.size = Pt(0.1)
+
+        table = document.add_table(rows=1, cols=2)
+        table.autofit = False
+        try:
+            table.allow_autofit = False
+        except Exception:
+            pass
+        set_table_borders_none(table)
+
+        left_width = clamp(divider, page_width * 0.35, page_width * 0.65)
+        right_width = max(1.0, page_width - left_width)
+        left_cell, right_cell = table.rows[0].cells
+        set_table_fixed_column_widths(table, [left_width, right_width])
+        set_cell_width(left_cell, left_width)
+        set_cell_width(right_cell, right_width)
+        set_cell_margins(left_cell, top=0, start=0, bottom=0, end=0)
+        set_cell_margins(right_cell, top=0, start=0, bottom=0, end=0)
+
+        # Remove the default empty paragraph's spacing before appending source
+        # content.  Word requires the paragraph to exist, but it need not take
+        # visible vertical space.
+        for cell in (left_cell, right_cell):
+            if cell.paragraphs:
+                p0 = cell.paragraphs[0]
+                p0.paragraph_format.space_before = Pt(0)
+                p0.paragraph_format.space_after = Pt(0)
+                p0.paragraph_format.line_spacing = Pt(0.1)
+                if not p0.text:
+                    r = p0.add_run("")
+                    r.font.size = Pt(0.1)
+
+        left_anchor = min([float(i.get("y0", 0) or 0) for i in left_items] or [0.0])
+        right_anchor = min([float(i.get("y0", 0) or 0) for i in right_items] or [0.0])
+        _render_normal_item_stream(
+            left_cell, left_items, element_lookup, table_lookup, translations,
+            rendered_ids, left_width, origin_x=0.0, initial_bottom=left_anchor,
+        )
+        _render_normal_item_stream(
+            right_cell, right_items, element_lookup, table_lookup, translations,
+            rendered_ids, right_width, origin_x=left_width, initial_bottom=right_anchor,
+        )
+
+    _render_normal_item_stream(
+        document, bottom_full, element_lookup, table_lookup, translations,
+        rendered_ids, page_width, origin_x=0.0,
+    )
+
+# ============================================================
 
 def create_word_from_structure(
     pages,
@@ -4058,6 +4345,16 @@ def create_word_from_structure(
                 [],
             )
         }
+
+        if int(page_data.get("column_count", 1) or 1) == 2 and page_data.get("column_divider_x"):
+            add_two_column_page(
+                document,
+                page_data,
+                element_lookup,
+                translations,
+                rendered_ids,
+            )
+            continue
 
         previous_bottom = None
 
