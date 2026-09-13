@@ -2474,30 +2474,122 @@ def get_form_label_bboxes(page_data):
     return result
 
 
+def rect_is_used_as_form_label(rect, label_bboxes):
+    """Return True only when *this exact rectangle* belongs to a field label.
+
+    Form PDFs often group a section heading, several field labels and small
+    helper text into one PyMuPDF text block. Treating the whole block as a
+    label caused unrelated lines inside that block to disappear. The matcher
+    is therefore reusable at line granularity.
+    """
+    for label_bbox in label_bboxes:
+        overlap = bbox_overlap_ratio(rect, label_bbox)
+        _, containment = _rect_metrics(rect, label_bbox)
+        if overlap >= 0.35 or containment >= 0.82:
+            return True
+    return False
+
+
 def element_is_used_as_form_label(
     element,
     label_bboxes,
 ):
     bbox = element.get("bbox", {})
-
     rect = (
         float(bbox.get("x0", 0)),
         float(bbox.get("y0", 0)),
         float(bbox.get("x1", 0)),
         float(bbox.get("y1", 0)),
     )
+    return rect_is_used_as_form_label(rect, label_bboxes)
 
-    for label_bbox in label_bboxes:
-        overlap = bbox_overlap_ratio(rect, label_bbox)
-        _, containment = _rect_metrics(rect, label_bbox)
 
-        # label_bbox is now line-sized. A label line can sit inside a much
-        # larger PDF text block, so containment is more reliable than using
-        # the whole element area as the denominator.
-        if overlap >= 0.35 or containment >= 0.82:
-            return True
+def form_element_line_events(element, label_bboxes):
+    """Split mixed form text blocks into safe, unclaimed line events.
 
-    return False
+    A line that is already the label of a detected writing field is omitted
+    here because add_form_row() renders it next to its field. Every other line
+    is kept. This creates a generic no-silent-loss rule for section headings,
+    locality/place labels and helper text without relying on any language or
+    page-specific wording.
+    """
+    lines = element.get("lines", []) or []
+    if not lines:
+        return []
+
+    result = []
+    matched_any_label_line = False
+
+    for line_index, line_data in enumerate(lines):
+        text = clean_text(line_data.get("text", ""))
+        if not text:
+            text = clean_text("".join(
+                span.get("text", "")
+                for span in (line_data.get("spans", []) or [])
+            ))
+        if not text:
+            continue
+
+        bbox = line_data.get("bbox") or element.get("bbox", {})
+        rect = (
+            float(bbox.get("x0", 0)),
+            float(bbox.get("y0", 0)),
+            float(bbox.get("x1", 0)),
+            float(bbox.get("y1", 0)),
+        )
+
+        if rect_is_used_as_form_label(rect, label_bboxes):
+            matched_any_label_line = True
+            continue
+
+        result.append({
+            "line_index": line_index,
+            "line": line_data,
+            "bbox": bbox,
+            "text": text,
+        })
+
+    # Only split blocks that actually contain at least one field-label line.
+    # Otherwise the normal block renderer remains preferable because it
+    # preserves multi-line paragraph flow better.
+    if not matched_any_label_line:
+        return []
+
+    return result
+
+
+def translated_form_line_text(element, line_index, fallback_text, translations):
+    translated_block = clean_text(
+        translations.get(element.get("id"), element.get("text", ""))
+    )
+    translated_lines = [
+        clean_text(part)
+        for part in translated_block.splitlines()
+        if clean_text(part)
+    ]
+
+    if line_index is not None and 0 <= int(line_index) < len(translated_lines):
+        return translated_lines[int(line_index)]
+
+    # If the translation model merged line breaks, do not drop the source
+    # line. Keeping visible source text is safer than silently removing a form
+    # heading/label. Normal cases still use the translated line above.
+    return clean_text(fallback_text)
+
+
+def form_line_proxy_element(element, line_data, bbox):
+    spans = line_data.get("spans", []) or []
+    style = get_block_style(spans) if spans else dict(element.get("style", {}))
+    return {
+        "id": element.get("id"),
+        "page": element.get("page"),
+        "type": element.get("type", "text_block"),
+        "role": element.get("role"),
+        "bbox": bbox,
+        "style": style,
+        "spans": spans,
+        "lines": [line_data],
+    }
 
 
 def add_form_heading_block(
@@ -2899,6 +2991,30 @@ def build_form_page_events(
         ):
             continue
 
+        # Mixed form blocks must be handled line-by-line. A whole PDF block
+        # may contain one detected field label plus unrelated structural text
+        # (section headings, place/location labels, instructions). Earlier
+        # code discarded the whole block as soon as one label overlapped it.
+        line_events = form_element_line_events(
+            element,
+            label_bboxes,
+        )
+
+        if line_events:
+            for item in line_events:
+                bbox = item["bbox"]
+                events.append({
+                    "kind": "text_line",
+                    "y": float(bbox.get("y0", 0)),
+                    "x": float(bbox.get("x0", 0)),
+                    "element": element,
+                    "line_index": item["line_index"],
+                    "line": item["line"],
+                    "bbox": bbox,
+                    "fallback_text": item["text"],
+                })
+            continue
+
         if element_is_used_as_form_label(
             element,
             label_bboxes,
@@ -3002,6 +3118,31 @@ def add_form_page(
                 page_width,
                 previous_y,
             )
+            rendered_ids.add(element["id"])
+
+        elif event["kind"] == "text_line":
+            element = event["element"]
+            line_text = translated_form_line_text(
+                element,
+                event.get("line_index"),
+                event.get("fallback_text", ""),
+                translations,
+            )
+            line_element = form_line_proxy_element(
+                element,
+                event.get("line", {}),
+                event.get("bbox", {}),
+            )
+            previous_y = add_form_heading_block(
+                document,
+                line_element,
+                line_text,
+                page_width,
+                previous_y,
+            )
+            # Mark the source block as globally handled. Its field-label lines
+            # can still be resolved below because add_form_row() searches the
+            # page element list directly rather than filtering rendered_ids.
             rendered_ids.add(element["id"])
 
         elif event["kind"] == "form_row":
