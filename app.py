@@ -71,9 +71,11 @@ FORM_DOCX_MIN_CELL_WIDTH_PT = 24.0
 
 # Footer detection
 ENABLE_FOOTER_DETECTION = True
-FOOTER_REGION_START_RATIO = 0.82
+FOOTER_SEARCH_REGION_START_RATIO = 0.60
+FOOTER_REGION_START_RATIO = 0.60
 FOOTER_HARD_REGION_START_RATIO = 0.93
 FOOTER_REPEAT_MIN_PAGES = 2
+FOOTER_POSITION_TOLERANCE_RATIO = 0.08
 FOOTER_PAGE_MARKER_REGEX = re.compile(
     r"\b(seite|sayfa|page|stand|version|sürüm|tarih|datum)\b",
     re.IGNORECASE,
@@ -1046,22 +1048,32 @@ def normalize_footer_relaxed_signature(text):
 
 
 def build_footer_signature_sets(document):
-    if not ENABLE_FOOTER_DETECTION:
-        return set(), set()
+    """
+    Find repeated lower-page blocks across the PDF.
 
-    exact_pages = {}
-    relaxed_pages = {}
+    The first implementation only scanned the bottom ~18% of a page.
+    Many PDFs place company address / phone / bank information noticeably
+    higher, so we now scan from 60% of page height downward and also keep
+    the typical relative Y position for every repeated signature.
+    """
+    if not ENABLE_FOOTER_DETECTION:
+        return {}, {}
+
+    exact_occurrences = {}
+    relaxed_occurrences = {}
 
     for page_index in range(len(document)):
         page = document[page_index]
-        page_height = float(page.rect.height)
+        page_height = max(1.0, float(page.rect.height))
         raw_blocks = extract_raw_text_blocks(page)
 
         for block in raw_blocks:
             bbox = block.get("bbox", {})
             y0 = float(bbox.get("y0", 0))
+            rel_y = y0 / page_height
 
-            if y0 < page_height * FOOTER_REGION_START_RATIO:
+            # Only consider the lower part of the page as a footer candidate.
+            if rel_y < FOOTER_SEARCH_REGION_START_RATIO:
                 continue
 
             text = clean_text(block.get("text", ""))
@@ -1072,24 +1084,38 @@ def build_footer_signature_sets(document):
             relaxed = normalize_footer_relaxed_signature(text)
 
             if exact:
-                exact_pages.setdefault(exact, set()).add(page_index)
+                exact_occurrences.setdefault(exact, []).append(
+                    (page_index, rel_y)
+                )
 
             if relaxed:
-                relaxed_pages.setdefault(relaxed, set()).add(page_index)
+                relaxed_occurrences.setdefault(relaxed, []).append(
+                    (page_index, rel_y)
+                )
 
-    exact_repeated = {
-        signature
-        for signature, page_ids in exact_pages.items()
-        if len(page_ids) >= FOOTER_REPEAT_MIN_PAGES
-    }
+    def build_repeated_map(occurrences):
+        repeated = {}
 
-    relaxed_repeated = {
-        signature
-        for signature, page_ids in relaxed_pages.items()
-        if len(page_ids) >= FOOTER_REPEAT_MIN_PAGES
-    }
+        for signature, items in occurrences.items():
+            page_ids = {page_index for page_index, _ in items}
 
-    return exact_repeated, relaxed_repeated
+            if len(page_ids) < FOOTER_REPEAT_MIN_PAGES:
+                continue
+
+            positions = sorted(rel_y for _, rel_y in items)
+            typical_y = statistics.median(positions)
+
+            repeated[signature] = {
+                "page_count": len(page_ids),
+                "typical_y": typical_y,
+            }
+
+        return repeated
+
+    return (
+        build_repeated_map(exact_occurrences),
+        build_repeated_map(relaxed_occurrences),
+    )
 
 
 def block_is_footer(
@@ -1104,9 +1130,11 @@ def block_is_footer(
     bbox = block.get("bbox", {})
     y0 = float(bbox.get("y0", 0))
     y1 = float(bbox.get("y1", y0))
+    page_height = max(1.0, float(page_height))
+    rel_y = y0 / page_height
 
-    # Never classify upper-page content as footer.
-    if y0 < page_height * FOOTER_REGION_START_RATIO:
+    # Keep true body content out of the footer classifier.
+    if rel_y < FOOTER_REGION_START_RATIO:
         return False
 
     text = clean_text(block.get("text", ""))
@@ -1116,13 +1144,23 @@ def block_is_footer(
     exact = normalize_footer_signature(text)
     relaxed = normalize_footer_relaxed_signature(text)
 
-    if exact in exact_footer_signatures:
+    def repeated_at_similar_position(signature, repeated_map):
+        info = repeated_map.get(signature)
+        if not info:
+            return False
+
+        typical_y = float(info.get("typical_y", rel_y))
+        return abs(rel_y - typical_y) <= FOOTER_POSITION_TOLERANCE_RATIO
+
+    # Repeated company/contact/footer blocks are accepted even when they are
+    # not extremely close to the physical bottom of the page.
+    if repeated_at_similar_position(exact, exact_footer_signatures):
         return True
 
-    if relaxed in relaxed_footer_signatures:
+    if repeated_at_similar_position(relaxed, relaxed_footer_signatures):
         return True
 
-    # Very bottom page markers are footer even if they appear on one page only.
+    # Very bottom page markers remain footers even if unique.
     hard_footer_zone = (
         y0 >= page_height * FOOTER_HARD_REGION_START_RATIO
         or y1 >= page_height * 0.97
