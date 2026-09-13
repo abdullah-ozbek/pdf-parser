@@ -81,6 +81,17 @@ FOOTER_PAGE_MARKER_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Header / letterhead detection
+ENABLE_HEADER_DETECTION = True
+HEADER_REGION_END_RATIO = 0.36
+HEADER_REPEAT_MIN_PAGES = 2
+HEADER_POSITION_TOLERANCE_RATIO = 0.08
+HEADER_CONTACT_REGEX = re.compile(
+    r"(gmbh|ag\b|kg\b|straße|strasse|telefon|tel\.?\s|telefax|fax\b|"
+    r"e-?mail|@|www\.|https?://|iban|bic|bank|sparkasse|\b\d{5}\s+[A-ZÄÖÜ])",
+    re.IGNORECASE,
+)
+
 # ============================================================
 # ROOT
 # ============================================================
@@ -1172,6 +1183,86 @@ def block_is_footer(
     return False
 
 # ============================================================
+# HEADER / LETTERHEAD DETECTION
+# ============================================================
+
+def normalize_header_signature(text):
+    text = clean_text(text).lower()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def build_header_signature_sets(document):
+    if not ENABLE_HEADER_DETECTION:
+        return {}
+
+    occurrences = {}
+
+    for page_index in range(len(document)):
+        page = document[page_index]
+        page_height = max(1.0, float(page.rect.height))
+        raw_blocks = extract_raw_text_blocks(page)
+
+        for block in raw_blocks:
+            bbox = block.get("bbox", {})
+            y0 = float(bbox.get("y0", 0))
+            rel_y = y0 / page_height
+
+            if rel_y > HEADER_REGION_END_RATIO:
+                continue
+
+            text = clean_text(block.get("text", ""))
+            if not text:
+                continue
+
+            sig = normalize_header_signature(text)
+            if sig:
+                occurrences.setdefault(sig, []).append((page_index, rel_y))
+
+    repeated = {}
+    for signature, items in occurrences.items():
+        page_ids = {page_index for page_index, _ in items}
+        if len(page_ids) < HEADER_REPEAT_MIN_PAGES:
+            continue
+        repeated[signature] = {
+            "page_count": len(page_ids),
+            "typical_y": statistics.median(rel_y for _, rel_y in items),
+        }
+
+    return repeated
+
+
+def block_is_header(block, page_height, repeated_header_signatures):
+    if not ENABLE_HEADER_DETECTION:
+        return False
+
+    bbox = block.get("bbox", {})
+    y0 = float(bbox.get("y0", 0))
+    page_height = max(1.0, float(page_height))
+    rel_y = y0 / page_height
+
+    if rel_y > HEADER_REGION_END_RATIO:
+        return False
+
+    text = clean_text(block.get("text", ""))
+    if not text:
+        return False
+
+    sig = normalize_header_signature(text)
+    info = repeated_header_signatures.get(sig)
+    if info:
+        typical_y = float(info.get("typical_y", rel_y))
+        if abs(rel_y - typical_y) <= HEADER_POSITION_TOLERANCE_RATIO:
+            return True
+
+    # Unique first-page letterheads are common. In the upper area, contact / company
+    # information is treated as letterhead even if it occurs only once.
+    if HEADER_CONTACT_REGEX.search(text):
+        return True
+
+    return False
+
+# ============================================================
 # MAIN EXTRACTION
 # ============================================================
 
@@ -1182,6 +1273,7 @@ def extract_pdf_structure(document):
     exact_footer_signatures, relaxed_footer_signatures = (
         build_footer_signature_sets(document)
     )
+    repeated_header_signatures = build_header_signature_sets(document)
 
     element_counter = 1
     table_counter = 1
@@ -1341,6 +1433,7 @@ def extract_pdf_structure(document):
             table_structures.append(table_data)
 
         text_elements = []
+        header_elements = []
         footer_elements = []
         detected_lists = []
 
@@ -1375,6 +1468,14 @@ def extract_pdf_structure(document):
                 exact_footer_signatures,
                 relaxed_footer_signatures,
             )
+            is_header = (
+                not is_footer
+                and block_is_header(
+                    block,
+                    page_height,
+                    repeated_header_signatures,
+                )
+            )
 
             element_id = f"pdf_{element_counter}"
             element_counter += 1
@@ -1395,6 +1496,23 @@ def extract_pdf_structure(document):
 
                 elements.append(element)
                 footer_elements.append(element)
+                continue
+
+            if is_header:
+                element = {
+                    "id": element_id,
+                    "page": page_number,
+                    "type": "header",
+                    "text": text,
+                    "bbox": block["bbox"],
+                    "role": "header",
+                    "style": block.get("style", {}),
+                    "lines": block.get("lines", []),
+                    "spans": block.get("spans", []),
+                    "list": None,
+                }
+                elements.append(element)
+                header_elements.append(element)
                 continue
 
             role = classify_text_role(
@@ -1472,6 +1590,7 @@ def extract_pdf_structure(document):
             "column_count": columns["column_count"],
             "column_divider_x": columns["divider_x"],
             "text_block_count": len(text_elements),
+            "header_block_count": len(header_elements),
             "footer_block_count": len(footer_elements),
             "table_count": len(table_structures),
             "list_count": len(detected_lists),
@@ -1493,6 +1612,7 @@ def extract_pdf_structure(document):
             "form_fields": form_fields,
             "form_rows": form_rows,
             "form_columns": form_columns,
+            "header_blocks": header_elements,
             "footer_blocks": footer_elements,
             "layout": layout_items,
         })
@@ -2340,7 +2460,9 @@ def add_form_row(
 def build_form_page_events(
     page_data,
     page_elements,
+    rendered_ids=None,
 ):
+    rendered_ids = rendered_ids or set()
     label_bboxes = get_form_label_bboxes(
         page_data
     )
@@ -2348,6 +2470,8 @@ def build_form_page_events(
     events = []
 
     for element in page_elements:
+        if element.get("id") in rendered_ids:
+            continue
         if element.get("type") not in (
             "text_block",
             "list_item",
@@ -2414,7 +2538,9 @@ def add_form_page(
     page_data,
     page_elements,
     translations,
+    rendered_ids=None,
 ):
+    rendered_ids = rendered_ids or set()
     page_width = float(
         page_data["width"]
     )
@@ -2430,6 +2556,7 @@ def add_form_page(
     events = build_form_page_events(
         page_data,
         page_elements,
+        rendered_ids,
     )
 
     previous_y = None
@@ -2453,6 +2580,7 @@ def add_form_page(
                 page_width,
                 previous_y,
             )
+            rendered_ids.add(element["id"])
 
         elif event["kind"] == "form_row":
             previous_y = add_form_row(
@@ -2463,6 +2591,58 @@ def add_form_page(
                 previous_y,
             )
 
+
+# ============================================================
+# WORD HEADER / LETTERHEAD
+# ============================================================
+
+def clear_header(header):
+    try:
+        for paragraph in list(header.paragraphs):
+            paragraph._element.getparent().remove(paragraph._element)
+    except Exception:
+        pass
+
+
+def add_page_header(section, page_data, element_lookup, translations, rendered_ids):
+    header_items = page_data.get("header_blocks", [])
+    if not header_items:
+        return
+
+    header = section.header
+    header.is_linked_to_previous = False
+    clear_header(header)
+
+    for item in sorted(
+        header_items,
+        key=lambda x: (float(x.get("bbox", {}).get("y0", 0)), float(x.get("bbox", {}).get("x0", 0))),
+    ):
+        element_id = item.get("id")
+        if not element_id or element_id in rendered_ids:
+            continue
+
+        element = element_lookup.get(element_id, item)
+        text = translations.get(element_id, element.get("text", ""))
+        if not clean_text(text):
+            rendered_ids.add(element_id)
+            continue
+
+        paragraph = header.add_paragraph()
+        paragraph.paragraph_format.space_before = Pt(0)
+        paragraph.paragraph_format.space_after = Pt(0)
+        paragraph.paragraph_format.line_spacing = 1
+
+        bbox = element.get("bbox", {})
+        paragraph.paragraph_format.left_indent = Pt(max(0, float(bbox.get("x0", 0))))
+
+        run = paragraph.add_run(text)
+        style = element.get("style", {})
+        run.font.name = style.get("font") or DEFAULT_FONT_NAME
+        size = float(style.get("size", 7.5) or 7.5)
+        run.font.size = Pt(clamp(size, 5.5, 9.5))
+        run.bold = bool(style.get("bold", False))
+        run.italic = bool(style.get("italic", False))
+        rendered_ids.add(element_id)
 
 # ============================================================
 # WORD FOOTER
@@ -2481,6 +2661,7 @@ def add_page_footer(
     page_data,
     element_lookup,
     translations,
+    rendered_ids,
 ):
     footer_items = page_data.get("footer_blocks", [])
     if not footer_items:
@@ -2500,6 +2681,8 @@ def add_page_footer(
 
     for item in sorted_items:
         element_id = item.get("id")
+        if not element_id or element_id in rendered_ids:
+            continue
         element = element_lookup.get(element_id, item)
 
         text = translations.get(
@@ -2528,6 +2711,7 @@ def add_page_footer(
         run.font.size = Pt(clamp(size, 5.5, 8.5))
         run.bold = bool(style.get("bold", False))
         run.italic = bool(style.get("italic", False))
+        rendered_ids.add(element_id)
 
 # ============================================================
 # CREATE WORD
@@ -2585,11 +2769,22 @@ def create_word_from_pdf(
             page_height,
         )
 
+        rendered_ids = set()
+
+        add_page_header(
+            section,
+            page_data,
+            element_lookup,
+            translations,
+            rendered_ids,
+        )
+
         add_page_footer(
             section,
             page_data,
             element_lookup,
             translations,
+            rendered_ids,
         )
 
         page_number = int(
@@ -2615,6 +2810,7 @@ def create_word_from_pdf(
                 page_data,
                 page_elements,
                 translations,
+                rendered_ids,
             )
             continue
 
@@ -2660,6 +2856,8 @@ def create_word_from_pdf(
                 continue
 
             element_id = item.get("id")
+            if not element_id or element_id in rendered_ids:
+                continue
             element = element_lookup.get(
                 element_id
             )
@@ -2684,6 +2882,7 @@ def create_word_from_pdf(
                 page_width,
                 previous_bottom,
             )
+            rendered_ids.add(element_id)
 
     output = BytesIO()
     document.save(output)
@@ -2749,6 +2948,10 @@ def extract_pdf():
             ),
             "form_row_count": sum(
                 page["form_row_count"]
+                for page in pages
+            ),
+            "header_block_count": sum(
+                page.get("header_block_count", 0)
                 for page in pages
             ),
             "footer_block_count": sum(
