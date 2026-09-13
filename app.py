@@ -46,6 +46,10 @@ COLUMN_GAP_RATIO = 0.08
 
 LINE_TOLERANCE = 1.5
 
+# İnce rectangle'ları line olarak yorumlamak için
+THIN_RECT_MAX_THICKNESS = 3.0
+MIN_LINE_LENGTH = 8.0
+
 
 # ============================================================
 # ROOT
@@ -64,12 +68,21 @@ def home():
 # ============================================================
 
 def clamp(value, minimum, maximum):
-    return max(minimum, min(maximum, value))
+    return max(
+        minimum,
+        min(
+            maximum,
+            value
+        )
+    )
 
 
 def round_num(value):
     try:
-        return round(float(value), 2)
+        return round(
+            float(value),
+            2
+        )
     except Exception:
         return 0.0
 
@@ -83,23 +96,46 @@ def bbox_dict(rect):
     }
 
 
-def rect_center_inside(inner_rect, outer_rect):
-    cx = (inner_rect[0] + inner_rect[2]) / 2
-    cy = (inner_rect[1] + inner_rect[3]) / 2
+def rect_center_inside(
+    inner_rect,
+    outer_rect
+):
+    cx = (
+        inner_rect[0]
+        +
+        inner_rect[2]
+    ) / 2
+
+    cy = (
+        inner_rect[1]
+        +
+        inner_rect[3]
+    ) / 2
 
     return (
-        outer_rect[0] <= cx <= outer_rect[2]
+        outer_rect[0]
+        <=
+        cx
+        <=
+        outer_rect[2]
         and
-        outer_rect[1] <= cy <= outer_rect[3]
+        outer_rect[1]
+        <=
+        cy
+        <=
+        outer_rect[3]
     )
 
 
 def rects_intersect(a, b):
     return not (
         a[2] <= b[0]
-        or a[0] >= b[2]
-        or a[3] <= b[1]
-        or a[1] >= b[3]
+        or
+        a[0] >= b[2]
+        or
+        a[3] <= b[1]
+        or
+        a[1] >= b[3]
     )
 
 
@@ -109,8 +145,15 @@ def clean_text(value):
 
     value = str(value)
 
-    value = value.replace("\u00ad", "")
-    value = value.replace("\u00a0", " ")
+    value = value.replace(
+        "\u00ad",
+        ""
+    )
+
+    value = value.replace(
+        "\u00a0",
+        " "
+    )
 
     return value.strip()
 
@@ -121,17 +164,35 @@ def clean_text(value):
 
 def rgb_from_int(color_value):
     try:
-        color_value = int(color_value)
+        color_value = int(
+            color_value
+        )
 
-        r = (color_value >> 16) & 255
-        g = (color_value >> 8) & 255
-        b = color_value & 255
+        r = (
+            color_value
+            >>
+            16
+        ) & 255
+
+        g = (
+            color_value
+            >>
+            8
+        ) & 255
+
+        b = (
+            color_value
+        ) & 255
 
         return {
             "r": r,
             "g": g,
             "b": b,
-            "hex": f"#{r:02X}{g:02X}{b:02X}"
+            "hex": (
+                f"#{r:02X}"
+                f"{g:02X}"
+                f"{b:02X}"
+            )
         }
 
     except Exception:
@@ -144,11 +205,24 @@ def rgb_from_int(color_value):
 
 
 def span_is_bold(span):
-    flags = int(span.get("flags", 0))
-    font = str(span.get("font", "")).lower()
+    flags = int(
+        span.get(
+            "flags",
+            0
+        )
+    )
+
+    font = str(
+        span.get(
+            "font",
+            ""
+        )
+    ).lower()
 
     return (
-        bool(flags & 16)
+        bool(
+            flags & 16
+        )
         or
         "bold" in font
         or
@@ -163,11 +237,24 @@ def span_is_bold(span):
 
 
 def span_is_italic(span):
-    flags = int(span.get("flags", 0))
-    font = str(span.get("font", "")).lower()
+    flags = int(
+        span.get(
+            "flags",
+            0
+        )
+    )
+
+    font = str(
+        span.get(
+            "font",
+            ""
+        )
+    ).lower()
 
     return (
-        bool(flags & 2)
+        bool(
+            flags & 2
+        )
         or
         "italic" in font
         or
@@ -176,30 +263,94 @@ def span_is_italic(span):
 
 
 def span_is_monospace(span):
-    flags = int(span.get("flags", 0))
+    flags = int(
+        span.get(
+            "flags",
+            0
+        )
+    )
 
-    return bool(flags & 8)
+    return bool(
+        flags & 8
+    )
 
 
 def span_is_serif(span):
-    flags = int(span.get("flags", 0))
+    flags = int(
+        span.get(
+            "flags",
+            0
+        )
+    )
 
-    return bool(flags & 4)
+    return bool(
+        flags & 4
+    )
 
 
 def normalize_span(span):
-    bbox = span.get("bbox", (0, 0, 0, 0))
+    bbox = span.get(
+        "bbox",
+        (0, 0, 0, 0)
+    )
 
     return {
-        "text": clean_text(span.get("text", "")),
-        "font": str(span.get("font", "")),
-        "size": round_num(span.get("size", 0)),
-        "bold": span_is_bold(span),
-        "italic": span_is_italic(span),
-        "monospace": span_is_monospace(span),
-        "serif": span_is_serif(span),
-        "color": rgb_from_int(span.get("color", 0)),
-        "bbox": bbox_dict(bbox)
+        "text":
+            clean_text(
+                span.get(
+                    "text",
+                    ""
+                )
+            ),
+
+        "font":
+            str(
+                span.get(
+                    "font",
+                    ""
+                )
+            ),
+
+        "size":
+            round_num(
+                span.get(
+                    "size",
+                    0
+                )
+            ),
+
+        "bold":
+            span_is_bold(
+                span
+            ),
+
+        "italic":
+            span_is_italic(
+                span
+            ),
+
+        "monospace":
+            span_is_monospace(
+                span
+            ),
+
+        "serif":
+            span_is_serif(
+                span
+            ),
+
+        "color":
+            rgb_from_int(
+                span.get(
+                    "color",
+                    0
+                )
+            ),
+
+        "bbox":
+            bbox_dict(
+                bbox
+            )
     }
 
 
@@ -221,19 +372,40 @@ def get_block_style(spans):
         }
 
     sizes = [
-        float(span.get("size", 0))
+        float(
+            span.get(
+                "size",
+                0
+            )
+        )
         for span in valid_spans
-        if float(span.get("size", 0)) > 0
+        if float(
+            span.get(
+                "size",
+                0
+            )
+        ) > 0
     ]
 
     fonts = [
-        span.get("font", "")
+        span.get(
+            "font",
+            ""
+        )
         for span in valid_spans
-        if span.get("font")
+        if span.get(
+            "font"
+        )
     ]
 
     colors = [
-        span.get("color", {}).get("hex", "#000000")
+        span.get(
+            "color",
+            {}
+        ).get(
+            "hex",
+            "#000000"
+        )
         for span in valid_spans
     ]
 
@@ -241,7 +413,9 @@ def get_block_style(spans):
 
     if fonts:
         try:
-            font = statistics.mode(fonts)
+            font = statistics.mode(
+                fonts
+            )
         except Exception:
             font = fonts[0]
 
@@ -249,17 +423,56 @@ def get_block_style(spans):
 
     if colors:
         try:
-            color = statistics.mode(colors)
+            color = statistics.mode(
+                colors
+            )
         except Exception:
             color = colors[0]
 
     return {
-        "font": font,
-        "size": round_num(statistics.median(sizes)) if sizes else 0,
-        "max_size": round_num(max(sizes)) if sizes else 0,
-        "bold": any(span.get("bold") for span in valid_spans),
-        "italic": any(span.get("italic") for span in valid_spans),
-        "color": color
+        "font":
+            font,
+
+        "size":
+            (
+                round_num(
+                    statistics.median(
+                        sizes
+                    )
+                )
+                if sizes
+                else 0
+            ),
+
+        "max_size":
+            (
+                round_num(
+                    max(
+                        sizes
+                    )
+                )
+                if sizes
+                else 0
+            ),
+
+        "bold":
+            any(
+                span.get(
+                    "bold"
+                )
+                for span in valid_spans
+            ),
+
+        "italic":
+            any(
+                span.get(
+                    "italic"
+                )
+                for span in valid_spans
+            ),
+
+        "color":
+            color
     }
 
 
@@ -292,9 +505,17 @@ def detect_list_info(text):
     if not text:
         return None
 
-    first_line = text.splitlines()[0].strip()
+    first_line = (
+        text
+        .splitlines()[0]
+        .strip()
+    )
 
-    bullet_match = BULLET_REGEX.match(first_line)
+    bullet_match = (
+        BULLET_REGEX.match(
+            first_line
+        )
+    )
 
     if bullet_match:
         return {
@@ -303,7 +524,11 @@ def detect_list_info(text):
             "marker": bullet_match.group(1)
         }
 
-    number_match = NUMBER_LIST_REGEX.match(first_line)
+    number_match = (
+        NUMBER_LIST_REGEX.match(
+            first_line
+        )
+    )
 
     if number_match:
         return {
@@ -321,12 +546,22 @@ def detect_list_info(text):
 
 def point_xy(point):
     try:
-        return float(point.x), float(point.y)
+        return (
+            float(point.x),
+            float(point.y)
+        )
+
     except Exception:
         try:
-            return float(point[0]), float(point[1])
+            return (
+                float(point[0]),
+                float(point[1])
+            )
         except Exception:
-            return 0.0, 0.0
+            return (
+                0.0,
+                0.0
+            )
 
 
 def normalize_drawings(page):
@@ -338,9 +573,16 @@ def normalize_drawings(page):
     rectangles_out = []
 
     try:
-        drawings = page.get_drawings()
+        drawings = (
+            page.get_drawings()
+        )
+
     except Exception as e:
-        print("get_drawings error:", str(e))
+        print(
+            "get_drawings error:",
+            str(e)
+        )
+
         return [], [], []
 
     drawing_counter = 1
@@ -348,106 +590,435 @@ def normalize_drawings(page):
     rect_counter = 1
 
     for drawing in drawings:
-        drawing_bbox = drawing.get("rect")
+
+        drawing_bbox = (
+            drawing.get(
+                "rect"
+            )
+        )
 
         drawing_data = {
-            "id": f"drawing_{drawing_counter}",
-            "type": "drawing",
-            "bbox": (
-                bbox_dict(drawing_bbox)
-                if drawing_bbox is not None
-                else None
-            ),
-            "fill": str(drawing.get("fill")),
-            "color": str(drawing.get("color")),
-            "width": round_num(drawing.get("width", 0))
+            "id":
+                f"drawing_{drawing_counter}",
+
+            "type":
+                "drawing",
+
+            "bbox":
+                (
+                    bbox_dict(
+                        drawing_bbox
+                    )
+                    if drawing_bbox is not None
+                    else None
+                ),
+
+            "fill":
+                str(
+                    drawing.get(
+                        "fill"
+                    )
+                ),
+
+            "color":
+                str(
+                    drawing.get(
+                        "color"
+                    )
+                ),
+
+            "width":
+                round_num(
+                    drawing.get(
+                        "width",
+                        0
+                    )
+                )
         }
 
         drawing_counter += 1
 
         drawing_items = []
 
-        for item in drawing.get("items", []):
+        for item in drawing.get(
+            "items",
+            []
+        ):
+
             if not item:
                 continue
 
             command = item[0]
 
-            # ------------------------------------------------
-            # LINE
-            # ------------------------------------------------
+            # =================================================
+            # REAL LINE
+            # =================================================
 
-            if command == "l" and len(item) >= 3:
-                x0, y0 = point_xy(item[1])
-                x1, y1 = point_xy(item[2])
+            if (
+                command == "l"
+                and
+                len(item) >= 3
+            ):
 
-                horizontal = abs(y1 - y0) <= LINE_TOLERANCE
-                vertical = abs(x1 - x0) <= LINE_TOLERANCE
+                x0, y0 = point_xy(
+                    item[1]
+                )
 
-                orientation = "diagonal"
+                x1, y1 = point_xy(
+                    item[2]
+                )
+
+                horizontal = (
+                    abs(
+                        y1 - y0
+                    )
+                    <=
+                    LINE_TOLERANCE
+                )
+
+                vertical = (
+                    abs(
+                        x1 - x0
+                    )
+                    <=
+                    LINE_TOLERANCE
+                )
+
+                orientation = (
+                    "diagonal"
+                )
 
                 if horizontal:
-                    orientation = "horizontal"
+                    orientation = (
+                        "horizontal"
+                    )
 
                 elif vertical:
-                    orientation = "vertical"
+                    orientation = (
+                        "vertical"
+                    )
+
+                length = (
+                    (
+                        (x1 - x0) ** 2
+                        +
+                        (y1 - y0) ** 2
+                    )
+                    ** 0.5
+                )
 
                 line = {
-                    "id": f"line_{line_counter}",
-                    "type": "line",
-                    "x0": round_num(x0),
-                    "y0": round_num(y0),
-                    "x1": round_num(x1),
-                    "y1": round_num(y1),
-                    "orientation": orientation,
-                    "length": round_num(
-                        ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
-                    ),
-                    "width": round_num(drawing.get("width", 0))
+                    "id":
+                        f"line_{line_counter}",
+
+                    "type":
+                        "line",
+
+                    "source":
+                        "line",
+
+                    "x0":
+                        round_num(
+                            x0
+                        ),
+
+                    "y0":
+                        round_num(
+                            y0
+                        ),
+
+                    "x1":
+                        round_num(
+                            x1
+                        ),
+
+                    "y1":
+                        round_num(
+                            y1
+                        ),
+
+                    "orientation":
+                        orientation,
+
+                    "length":
+                        round_num(
+                            length
+                        ),
+
+                    "thickness":
+                        round_num(
+                            drawing.get(
+                                "width",
+                                0
+                            )
+                        )
                 }
 
                 line_counter += 1
-                lines_out.append(line)
-                drawing_items.append(line)
 
-            # ------------------------------------------------
+                lines_out.append(
+                    line
+                )
+
+                drawing_items.append(
+                    line
+                )
+
+            # =================================================
             # RECTANGLE
-            # ------------------------------------------------
+            # =================================================
 
-            elif command == "re" and len(item) >= 2:
+            elif (
+                command == "re"
+                and
+                len(item) >= 2
+            ):
+
                 rect = item[1]
 
                 try:
-                    rect_tuple = (
-                        float(rect.x0),
-                        float(rect.y0),
-                        float(rect.x1),
-                        float(rect.y1)
+
+                    x0 = float(
+                        rect.x0
                     )
 
-                    rect_data = {
-                        "id": f"rect_{rect_counter}",
-                        "type": "rectangle",
-                        "bbox": bbox_dict(rect_tuple),
-                        "width": round_num(
-                            rect_tuple[2] - rect_tuple[0]
-                        ),
-                        "height": round_num(
-                            rect_tuple[3] - rect_tuple[1]
+                    y0 = float(
+                        rect.y0
+                    )
+
+                    x1 = float(
+                        rect.x1
+                    )
+
+                    y1 = float(
+                        rect.y1
+                    )
+
+                    rect_width = abs(
+                        x1 - x0
+                    )
+
+                    rect_height = abs(
+                        y1 - y0
+                    )
+
+                    # =========================================
+                    # THIN HORIZONTAL RECTANGLE -> LINE
+                    # =========================================
+
+                    if (
+                        rect_height
+                        <=
+                        THIN_RECT_MAX_THICKNESS
+                        and
+                        rect_width
+                        >=
+                        MIN_LINE_LENGTH
+                    ):
+
+                        center_y = (
+                            y0 + y1
+                        ) / 2
+
+                        line = {
+                            "id":
+                                f"line_{line_counter}",
+
+                            "type":
+                                "line",
+
+                            "source":
+                                "thin_rectangle",
+
+                            "x0":
+                                round_num(
+                                    min(
+                                        x0,
+                                        x1
+                                    )
+                                ),
+
+                            "y0":
+                                round_num(
+                                    center_y
+                                ),
+
+                            "x1":
+                                round_num(
+                                    max(
+                                        x0,
+                                        x1
+                                    )
+                                ),
+
+                            "y1":
+                                round_num(
+                                    center_y
+                                ),
+
+                            "orientation":
+                                "horizontal",
+
+                            "length":
+                                round_num(
+                                    rect_width
+                                ),
+
+                            "thickness":
+                                round_num(
+                                    rect_height
+                                )
+                        }
+
+                        line_counter += 1
+
+                        lines_out.append(
+                            line
                         )
+
+                        drawing_items.append(
+                            line
+                        )
+
+                        continue
+
+                    # =========================================
+                    # THIN VERTICAL RECTANGLE -> LINE
+                    # =========================================
+
+                    if (
+                        rect_width
+                        <=
+                        THIN_RECT_MAX_THICKNESS
+                        and
+                        rect_height
+                        >=
+                        MIN_LINE_LENGTH
+                    ):
+
+                        center_x = (
+                            x0 + x1
+                        ) / 2
+
+                        line = {
+                            "id":
+                                f"line_{line_counter}",
+
+                            "type":
+                                "line",
+
+                            "source":
+                                "thin_rectangle",
+
+                            "x0":
+                                round_num(
+                                    center_x
+                                ),
+
+                            "y0":
+                                round_num(
+                                    min(
+                                        y0,
+                                        y1
+                                    )
+                                ),
+
+                            "x1":
+                                round_num(
+                                    center_x
+                                ),
+
+                            "y1":
+                                round_num(
+                                    max(
+                                        y0,
+                                        y1
+                                    )
+                                ),
+
+                            "orientation":
+                                "vertical",
+
+                            "length":
+                                round_num(
+                                    rect_height
+                                ),
+
+                            "thickness":
+                                round_num(
+                                    rect_width
+                                )
+                        }
+
+                        line_counter += 1
+
+                        lines_out.append(
+                            line
+                        )
+
+                        drawing_items.append(
+                            line
+                        )
+
+                        continue
+
+                    # =========================================
+                    # NORMAL RECTANGLE
+                    # =========================================
+
+                    rect_data = {
+                        "id":
+                            f"rect_{rect_counter}",
+
+                        "type":
+                            "rectangle",
+
+                        "bbox":
+                            bbox_dict(
+                                (
+                                    x0,
+                                    y0,
+                                    x1,
+                                    y1
+                                )
+                            ),
+
+                        "width":
+                            round_num(
+                                rect_width
+                            ),
+
+                        "height":
+                            round_num(
+                                rect_height
+                            )
                     }
 
                     rect_counter += 1
-                    rectangles_out.append(rect_data)
-                    drawing_items.append(rect_data)
 
-                except Exception:
-                    pass
+                    rectangles_out.append(
+                        rect_data
+                    )
 
-        drawing_data["items"] = drawing_items
+                    drawing_items.append(
+                        rect_data
+                    )
+
+                except Exception as e:
+
+                    print(
+                        "Rectangle parse error:",
+                        str(e)
+                    )
+
+        drawing_data[
+            "items"
+        ] = drawing_items
 
         if drawing_items:
-            drawings_out.append(drawing_data)
+            drawings_out.append(
+                drawing_data
+            )
 
     return (
         drawings_out,
@@ -460,24 +1031,53 @@ def normalize_drawings(page):
 # FORM LINE DETECTION
 # ============================================================
 
-def detect_form_lines(lines, page_width):
+def detect_form_lines(
+    lines,
+    page_width
+):
     form_lines = []
 
-    minimum_form_line = page_width * 0.08
-    maximum_form_line = page_width * 0.80
+    minimum_form_line = (
+        page_width
+        *
+        0.08
+    )
+
+    maximum_form_line = (
+        page_width
+        *
+        0.80
+    )
 
     for line in lines:
-        if line.get("orientation") != "horizontal":
+        if (
+            line.get(
+                "orientation"
+            )
+            !=
+            "horizontal"
+        ):
             continue
 
-        length = float(line.get("length", 0))
+        length = float(
+            line.get(
+                "length",
+                0
+            )
+        )
 
         if (
-            length >= minimum_form_line
+            length
+            >=
+            minimum_form_line
             and
-            length <= maximum_form_line
+            length
+            <=
+            maximum_form_line
         ):
-            form_lines.append(line)
+            form_lines.append(
+                line
+            )
 
     return form_lines
 
@@ -491,15 +1091,23 @@ def find_page_tables(page):
         return []
 
     try:
-        finder = page.find_tables()
+        finder = (
+            page.find_tables()
+        )
 
         if finder is None:
             return []
 
-        return list(finder.tables)
+        return list(
+            finder.tables
+        )
 
     except Exception as e:
-        print("Table detection error:", str(e))
+        print(
+            "Table detection error:",
+            str(e)
+        )
+
         return []
 
 
@@ -519,51 +1127,77 @@ def clean_table_matrix(matrix):
 
         for value in row:
             cleaned_row.append(
-                clean_text(value)
+                clean_text(
+                    value
+                )
             )
 
         max_columns = max(
             max_columns,
-            len(cleaned_row)
+            len(
+                cleaned_row
+            )
         )
 
-        cleaned.append(cleaned_row)
+        cleaned.append(
+            cleaned_row
+        )
 
     if max_columns == 0:
         return []
 
     for row in cleaned:
-        while len(row) < max_columns:
+        while len(
+            row
+        ) < max_columns:
             row.append("")
 
     cleaned = [
         row
         for row in cleaned
-        if any(value.strip() for value in row)
+        if any(
+            value.strip()
+            for value in row
+        )
     ]
 
     return cleaned
 
 
-def extract_table_cell_bboxes(detected_table):
+def extract_table_cell_bboxes(
+    detected_table
+):
     result = []
 
     try:
-        rows = detected_table.rows
+        rows = (
+            detected_table.rows
+        )
 
-        for row_index, row in enumerate(rows):
+        for row_index, row in enumerate(
+            rows
+        ):
             row_result = []
 
-            for col_index, cell in enumerate(row.cells):
+            for col_index, cell in enumerate(
+                row.cells
+            ):
                 if cell is None:
-                    row_result.append(None)
+                    row_result.append(
+                        None
+                    )
+
                     continue
 
                 row_result.append(
-                    bbox_dict(cell)
+                    bbox_dict(
+                        cell
+                    )
                 )
 
-            result.append(row_result)
+            result.append(
+                row_result
+            )
 
     except Exception:
         pass
@@ -581,13 +1215,27 @@ def extract_raw_text_blocks(page):
             "dict",
             flags=fitz.TEXT_PRESERVE_WHITESPACE
         )
+
     except Exception:
-        text_dict = page.get_text("dict")
+        text_dict = (
+            page.get_text(
+                "dict"
+            )
+        )
 
     blocks_out = []
 
-    for raw_block in text_dict.get("blocks", []):
-        if raw_block.get("type") != 0:
+    for raw_block in text_dict.get(
+        "blocks",
+        []
+    ):
+        if (
+            raw_block.get(
+                "type"
+            )
+            !=
+            0
+        ):
             continue
 
         block_bbox = raw_block.get(
@@ -599,15 +1247,25 @@ def extract_raw_text_blocks(page):
         all_spans = []
         text_lines = []
 
-        for raw_line in raw_block.get("lines", []):
+        for raw_line in raw_block.get(
+            "lines",
+            []
+        ):
+
             line_spans = []
 
-            for raw_span in raw_line.get("spans", []):
+            for raw_span in raw_line.get(
+                "spans",
+                []
+            ):
+
                 normalized = normalize_span(
                     raw_span
                 )
 
-                if not normalized["text"]:
+                if not normalized[
+                    "text"
+                ]:
                     continue
 
                 line_spans.append(
@@ -635,9 +1293,16 @@ def extract_raw_text_blocks(page):
             )
 
             lines_out.append({
-                "text": line_text,
-                "bbox": bbox_dict(line_bbox),
-                "spans": line_spans
+                "text":
+                    line_text,
+
+                "bbox":
+                    bbox_dict(
+                        line_bbox
+                    ),
+
+                "spans":
+                    line_spans
             })
 
             text_lines.append(
@@ -652,11 +1317,24 @@ def extract_raw_text_blocks(page):
             continue
 
         blocks_out.append({
-            "text": text,
-            "bbox": bbox_dict(block_bbox),
-            "lines": lines_out,
-            "spans": all_spans,
-            "style": get_block_style(all_spans)
+            "text":
+                text,
+
+            "bbox":
+                bbox_dict(
+                    block_bbox
+                ),
+
+            "lines":
+                lines_out,
+
+            "spans":
+                all_spans,
+
+            "style":
+                get_block_style(
+                    all_spans
+                )
         })
 
     return blocks_out
@@ -666,31 +1344,51 @@ def extract_raw_text_blocks(page):
 # PAGE FONT STATISTICS
 # ============================================================
 
-def get_page_font_statistics(blocks):
+def get_page_font_statistics(
+    blocks
+):
     sizes = []
 
     for block in blocks:
-        for span in block.get("spans", []):
+        for span in block.get(
+            "spans",
+            []
+        ):
             size = float(
-                span.get("size", 0)
+                span.get(
+                    "size",
+                    0
+                )
             )
 
             if size > 0:
-                sizes.append(size)
+                sizes.append(
+                    size
+                )
 
     if not sizes:
         return {
-            "median_size": DEFAULT_FONT_SIZE,
-            "max_size": DEFAULT_FONT_SIZE
+            "median_size":
+                DEFAULT_FONT_SIZE,
+
+            "max_size":
+                DEFAULT_FONT_SIZE
         }
 
     return {
-        "median_size": round_num(
-            statistics.median(sizes)
-        ),
-        "max_size": round_num(
-            max(sizes)
-        )
+        "median_size":
+            round_num(
+                statistics.median(
+                    sizes
+                )
+            ),
+
+        "max_size":
+            round_num(
+                max(
+                    sizes
+                )
+            )
     }
 
 
@@ -698,9 +1396,15 @@ def get_page_font_statistics(blocks):
 # HEADING DETECTION
 # ============================================================
 
-def classify_text_role(block, font_stats):
+def classify_text_role(
+    block,
+    font_stats
+):
     text = clean_text(
-        block.get("text", "")
+        block.get(
+            "text",
+            ""
+        )
     )
 
     style = block.get(
@@ -742,12 +1446,22 @@ def classify_text_role(block, font_stats):
         )
     )
 
-    short_text = len(text) <= 120
+    short_text = (
+        len(
+            text
+        )
+        <=
+        120
+    )
 
     if (
         short_text
         and
-        max_size >= median_size * HEADING_LARGE_RATIO
+        max_size
+        >=
+        median_size
+        *
+        HEADING_LARGE_RATIO
     ):
         return "heading_1"
 
@@ -756,7 +1470,11 @@ def classify_text_role(block, font_stats):
         and
         bold
         and
-        max_size >= median_size * HEADING_SIZE_RATIO
+        max_size
+        >=
+        median_size
+        *
+        HEADING_SIZE_RATIO
     ):
         return "heading_2"
 
@@ -776,7 +1494,10 @@ def classify_text_role(block, font_stats):
 # COLUMN DETECTION
 # ============================================================
 
-def detect_columns(blocks, page_width):
+def detect_columns(
+    blocks,
+    page_width
+):
     if not ENABLE_COLUMN_DETECTION:
         return {
             "column_count": 1,
@@ -805,24 +1526,45 @@ def detect_columns(blocks, page_width):
             )
         )
 
-        width = x1 - x0
+        width = (
+            x1 - x0
+        )
 
         if (
             width > 10
             and
-            width < page_width * 0.70
+            width
+            <
+            page_width
+            *
+            0.70
         ):
             candidates.append(
-                (x0, x1)
+                (
+                    x0,
+                    x1
+                )
             )
 
-    if len(candidates) < COLUMN_MIN_BLOCKS * 2:
+    if (
+        len(
+            candidates
+        )
+        <
+        COLUMN_MIN_BLOCKS
+        *
+        2
+    ):
         return {
             "column_count": 1,
             "divider_x": None
         }
 
-    page_center = page_width / 2
+    page_center = (
+        page_width
+        /
+        2
+    )
 
     left = [
         item
@@ -833,43 +1575,72 @@ def detect_columns(blocks, page_width):
     right = [
         item
         for item in candidates
-        if item[0] >= page_center * 0.85
+        if item[0]
+        >=
+        page_center
+        *
+        0.85
     ]
 
     if (
-        len(left) < COLUMN_MIN_BLOCKS
+        len(
+            left
+        )
+        <
+        COLUMN_MIN_BLOCKS
         or
-        len(right) < COLUMN_MIN_BLOCKS
+        len(
+            right
+        )
+        <
+        COLUMN_MIN_BLOCKS
     ):
         return {
             "column_count": 1,
             "divider_x": None
         }
 
-    left_right_edge = statistics.median(
-        item[1]
-        for item in left
+    left_right_edge = (
+        statistics.median(
+            item[1]
+            for item in left
+        )
     )
 
-    right_left_edge = statistics.median(
-        item[0]
-        for item in right
+    right_left_edge = (
+        statistics.median(
+            item[0]
+            for item in right
+        )
     )
 
     gap = (
-        right_left_edge -
+        right_left_edge
+        -
         left_right_edge
     )
 
-    if gap >= page_width * COLUMN_GAP_RATIO:
+    if (
+        gap
+        >=
+        page_width
+        *
+        COLUMN_GAP_RATIO
+    ):
         return {
-            "column_count": 2,
-            "divider_x": round_num(
-                (
-                    left_right_edge +
-                    right_left_edge
-                ) / 2
-            )
+            "column_count":
+                2,
+
+            "divider_x":
+                round_num(
+                    (
+                        left_right_edge
+                        +
+                        right_left_edge
+                    )
+                    /
+                    2
+                )
         }
 
     return {
@@ -882,18 +1653,40 @@ def detect_columns(blocks, page_width):
 # UNDERLINE DETECTION
 # ============================================================
 
-def detect_span_underlines(spans, horizontal_lines):
+def detect_span_underlines(
+    spans,
+    horizontal_lines
+):
     for span in spans:
-        span["underline"] = False
+        span[
+            "underline"
+        ] = False
 
         bbox = span.get(
             "bbox",
             {}
         )
 
-        x0 = float(bbox.get("x0", 0))
-        y1 = float(bbox.get("y1", 0))
-        x1 = float(bbox.get("x1", 0))
+        x0 = float(
+            bbox.get(
+                "x0",
+                0
+            )
+        )
+
+        y1 = float(
+            bbox.get(
+                "y1",
+                0
+            )
+        )
+
+        x1 = float(
+            bbox.get(
+                "x1",
+                0
+            )
+        )
 
         text_width = max(
             1,
@@ -901,16 +1694,41 @@ def detect_span_underlines(spans, horizontal_lines):
         )
 
         for line in horizontal_lines:
-            ly = float(line.get("y0", 0))
+            ly = float(
+                line.get(
+                    "y0",
+                    0
+                )
+            )
 
             lx0 = min(
-                float(line.get("x0", 0)),
-                float(line.get("x1", 0))
+                float(
+                    line.get(
+                        "x0",
+                        0
+                    )
+                ),
+                float(
+                    line.get(
+                        "x1",
+                        0
+                    )
+                )
             )
 
             lx1 = max(
-                float(line.get("x0", 0)),
-                float(line.get("x1", 0))
+                float(
+                    line.get(
+                        "x0",
+                        0
+                    )
+                ),
+                float(
+                    line.get(
+                        "x1",
+                        0
+                    )
+                )
             )
 
             vertical_distance = abs(
@@ -919,21 +1737,36 @@ def detect_span_underlines(spans, horizontal_lines):
 
             overlap = max(
                 0,
-                min(x1, lx1) -
-                max(x0, lx0)
+                min(
+                    x1,
+                    lx1
+                )
+                -
+                max(
+                    x0,
+                    lx0
+                )
             )
 
             overlap_ratio = (
-                overlap /
+                overlap
+                /
                 text_width
             )
 
             if (
-                vertical_distance <= 3.0
+                vertical_distance
+                <=
+                3.0
                 and
-                overlap_ratio >= 0.50
+                overlap_ratio
+                >=
+                0.50
             ):
-                span["underline"] = True
+                span[
+                    "underline"
+                ] = True
+
                 break
 
 
@@ -941,7 +1774,9 @@ def detect_span_underlines(spans, horizontal_lines):
 # MAIN PDF STRUCTURE EXTRACTION
 # ============================================================
 
-def extract_pdf_structure(document):
+def extract_pdf_structure(
+    document
+):
     pages = []
     elements = []
 
@@ -949,8 +1784,11 @@ def extract_pdf_structure(document):
     table_counter = 1
 
     for page_index in range(
-        len(document)
+        len(
+            document
+        )
     ):
+
         page = document[
             page_index
         ]
@@ -984,7 +1822,9 @@ def extract_pdf_structure(document):
             for line in lines
             if line.get(
                 "orientation"
-            ) == "horizontal"
+            )
+            ==
+            "horizontal"
         ]
 
         vertical_lines = [
@@ -992,7 +1832,9 @@ def extract_pdf_structure(document):
             for line in lines
             if line.get(
                 "orientation"
-            ) == "vertical"
+            )
+            ==
+            "vertical"
         ]
 
         form_lines = detect_form_lines(
@@ -1004,11 +1846,14 @@ def extract_pdf_structure(document):
         # TEXT
         # ====================================================
 
-        raw_blocks = extract_raw_text_blocks(
-            page
+        raw_blocks = (
+            extract_raw_text_blocks(
+                page
+            )
         )
 
         for block in raw_blocks:
+
             detect_span_underlines(
                 block.get(
                     "spans",
@@ -1021,6 +1866,7 @@ def extract_pdf_structure(document):
                 "lines",
                 []
             ):
+
                 detect_span_underlines(
                     line_data.get(
                         "spans",
@@ -1029,55 +1875,78 @@ def extract_pdf_structure(document):
                     horizontal_lines
                 )
 
-        font_stats = get_page_font_statistics(
-            raw_blocks
+        font_stats = (
+            get_page_font_statistics(
+                raw_blocks
+            )
         )
 
         # ====================================================
         # TABLES
         # ====================================================
 
-        detected_tables = find_page_tables(
-            page
+        detected_tables = (
+            find_page_tables(
+                page
+            )
         )
 
         table_regions = []
         table_structures = []
-        table_cell_elements = []
 
         for detected_table in detected_tables:
+
             try:
-                bbox = detected_table.bbox
+
+                bbox = (
+                    detected_table.bbox
+                )
 
                 table_bbox = (
-                    float(bbox[0]),
-                    float(bbox[1]),
-                    float(bbox[2]),
-                    float(bbox[3])
+                    float(
+                        bbox[0]
+                    ),
+                    float(
+                        bbox[1]
+                    ),
+                    float(
+                        bbox[2]
+                    ),
+                    float(
+                        bbox[3]
+                    )
                 )
 
                 raw_matrix = (
                     detected_table.extract()
                 )
 
-                matrix = clean_table_matrix(
-                    raw_matrix
+                matrix = (
+                    clean_table_matrix(
+                        raw_matrix
+                    )
                 )
 
             except Exception as e:
+
                 print(
                     "Could not parse table:",
                     str(e)
                 )
+
                 continue
 
             if not matrix:
                 continue
 
-            row_count = len(matrix)
+            row_count = len(
+                matrix
+            )
 
             column_count = max(
-                len(row)
+                len(
+                    row
+                )
                 for row in matrix
             )
 
@@ -1101,32 +1970,55 @@ def extract_pdf_structure(document):
             )
 
             table_data = {
-                "table_id": table_id,
-                "type": "table",
-                "page": page_number,
-                "bbox": bbox_dict(
-                    table_bbox
-                ),
-                "row_count": row_count,
-                "column_count": column_count,
-                "rows": []
+                "table_id":
+                    table_id,
+
+                "type":
+                    "table",
+
+                "page":
+                    page_number,
+
+                "bbox":
+                    bbox_dict(
+                        table_bbox
+                    ),
+
+                "row_count":
+                    row_count,
+
+                "column_count":
+                    column_count,
+
+                "rows":
+                    []
             }
 
             for row_index in range(
                 row_count
             ):
+
                 row_data = []
 
                 for col_index in range(
                     column_count
                 ):
+
                     value = ""
 
                     if (
-                        row_index < len(matrix)
+                        row_index
+                        <
+                        len(
+                            matrix
+                        )
                         and
-                        col_index < len(
-                            matrix[row_index]
+                        col_index
+                        <
+                        len(
+                            matrix[
+                                row_index
+                            ]
                         )
                     ):
                         value = clean_text(
@@ -1140,12 +2032,18 @@ def extract_pdf_structure(document):
                     cell_bbox = None
 
                     if (
-                        row_index < len(
+                        row_index
+                        <
+                        len(
                             cell_bboxes
                         )
                         and
-                        col_index < len(
-                            cell_bboxes[row_index]
+                        col_index
+                        <
+                        len(
+                            cell_bboxes[
+                                row_index
+                            ]
                         )
                     ):
                         cell_bbox = (
@@ -1157,11 +2055,14 @@ def extract_pdf_structure(document):
                         )
 
                     if not cell_bbox:
-                        cell_bbox = bbox_dict(
-                            table_bbox
+                        cell_bbox = (
+                            bbox_dict(
+                                table_bbox
+                            )
                         )
 
                     if value:
+
                         element_id = (
                             f"pdf_{element_counter}"
                         )
@@ -1169,21 +2070,32 @@ def extract_pdf_structure(document):
                         element_counter += 1
 
                         element = {
-                            "id": element_id,
-                            "page": page_number,
-                            "type": "table_cell",
-                            "table_id": table_id,
-                            "row": row_index,
-                            "col": col_index,
-                            "text": value,
-                            "bbox": cell_bbox
+                            "id":
+                                element_id,
+
+                            "page":
+                                page_number,
+
+                            "type":
+                                "table_cell",
+
+                            "table_id":
+                                table_id,
+
+                            "row":
+                                row_index,
+
+                            "col":
+                                col_index,
+
+                            "text":
+                                value,
+
+                            "bbox":
+                                cell_bbox
                         }
 
                         elements.append(
-                            element
-                        )
-
-                        table_cell_elements.append(
                             element
                         )
 
@@ -1191,11 +2103,20 @@ def extract_pdf_structure(document):
                         element_id = None
 
                     row_data.append({
-                        "id": element_id,
-                        "row": row_index,
-                        "col": col_index,
-                        "text": value,
-                        "bbox": cell_bbox
+                        "id":
+                            element_id,
+
+                        "row":
+                            row_index,
+
+                        "col":
+                            col_index,
+
+                        "text":
+                            value,
+
+                        "bbox":
+                            cell_bbox
                     })
 
                 table_data[
@@ -1220,21 +2141,43 @@ def extract_pdf_structure(document):
         detected_lists = []
 
         for block in raw_blocks:
+
             bbox = block.get(
                 "bbox",
                 {}
             )
 
             block_rect = (
-                float(bbox.get("x0", 0)),
-                float(bbox.get("y0", 0)),
-                float(bbox.get("x1", 0)),
-                float(bbox.get("y1", 0))
+                float(
+                    bbox.get(
+                        "x0",
+                        0
+                    )
+                ),
+                float(
+                    bbox.get(
+                        "y0",
+                        0
+                    )
+                ),
+                float(
+                    bbox.get(
+                        "x1",
+                        0
+                    )
+                ),
+                float(
+                    bbox.get(
+                        "y1",
+                        0
+                    )
+                )
             )
 
             inside_table = False
 
             for table_rect in table_regions:
+
                 if rect_center_inside(
                     block_rect,
                     table_rect
@@ -1261,40 +2204,69 @@ def extract_pdf_structure(document):
 
             element_counter += 1
 
-            text_role = classify_text_role(
-                block,
-                font_stats
+            text_role = (
+                classify_text_role(
+                    block,
+                    font_stats
+                )
             )
 
-            list_info = detect_list_info(
-                text
+            list_info = (
+                detect_list_info(
+                    text
+                )
             )
 
-            element_type = "text_block"
+            element_type = (
+                "text_block"
+            )
 
             if list_info:
-                element_type = "list_item"
+                element_type = (
+                    "list_item"
+                )
 
             element = {
-                "id": element_id,
-                "page": page_number,
-                "type": element_type,
-                "text": text,
-                "bbox": block["bbox"],
-                "role": text_role,
-                "style": block.get(
-                    "style",
-                    {}
-                ),
-                "lines": block.get(
-                    "lines",
-                    []
-                ),
-                "spans": block.get(
-                    "spans",
-                    []
-                ),
-                "list": list_info
+                "id":
+                    element_id,
+
+                "page":
+                    page_number,
+
+                "type":
+                    element_type,
+
+                "text":
+                    text,
+
+                "bbox":
+                    block[
+                        "bbox"
+                    ],
+
+                "role":
+                    text_role,
+
+                "style":
+                    block.get(
+                        "style",
+                        {}
+                    ),
+
+                "lines":
+                    block.get(
+                        "lines",
+                        []
+                    ),
+
+                "spans":
+                    block.get(
+                        "spans",
+                        []
+                    ),
+
+                "list":
+                    list_info
             }
 
             elements.append(
@@ -1306,71 +2278,99 @@ def extract_pdf_structure(document):
             )
 
             if list_info:
+
                 detected_lists.append({
-                    "id": element_id,
-                    "bbox": block[
-                        "bbox"
-                    ],
-                    "list_type": list_info[
-                        "list_type"
-                    ],
-                    "marker": list_info[
-                        "marker"
-                    ],
-                    "text": text
+                    "id":
+                        element_id,
+
+                    "bbox":
+                        block[
+                            "bbox"
+                        ],
+
+                    "list_type":
+                        list_info[
+                            "list_type"
+                        ],
+
+                    "marker":
+                        list_info[
+                            "marker"
+                        ],
+
+                    "text":
+                        text
                 })
 
         # ====================================================
         # COLUMN DETECTION
         # ====================================================
 
-        columns = detect_columns(
-            raw_blocks,
-            page_width
+        columns = (
+            detect_columns(
+                raw_blocks,
+                page_width
+            )
         )
 
         # ====================================================
-        # PAGE LAYOUT ORDER
+        # PAGE LAYOUT
         # ====================================================
 
         layout_items = []
 
         for element in text_elements:
+
             layout_items.append({
-                "type": element[
-                    "type"
-                ],
-                "id": element[
-                    "id"
-                ],
-                "x0": element[
-                    "bbox"
-                ][
-                    "x0"
-                ],
-                "y0": element[
-                    "bbox"
-                ][
-                    "y0"
-                ]
+                "type":
+                    element[
+                        "type"
+                    ],
+
+                "id":
+                    element[
+                        "id"
+                    ],
+
+                "x0":
+                    element[
+                        "bbox"
+                    ][
+                        "x0"
+                    ],
+
+                "y0":
+                    element[
+                        "bbox"
+                    ][
+                        "y0"
+                    ]
             })
 
         for table in table_structures:
+
             layout_items.append({
-                "type": "table",
-                "table_id": table[
-                    "table_id"
-                ],
-                "x0": table[
-                    "bbox"
-                ][
-                    "x0"
-                ],
-                "y0": table[
-                    "bbox"
-                ][
-                    "y0"
-                ]
+                "type":
+                    "table",
+
+                "table_id":
+                    table[
+                        "table_id"
+                    ],
+
+                "x0":
+                    table[
+                        "bbox"
+                    ][
+                        "x0"
+                    ],
+
+                "y0":
+                    table[
+                        "bbox"
+                    ][
+                        "y0"
+                    ]
             })
 
         layout_items.sort(
@@ -1395,67 +2395,97 @@ def extract_pdf_structure(document):
         # ====================================================
 
         pages.append({
-            "page": page_number,
-            "width": round_num(
-                page_width
-            ),
-            "height": round_num(
-                page_height
-            ),
+            "page":
+                page_number,
 
-            "font_statistics": font_stats,
+            "width":
+                round_num(
+                    page_width
+                ),
 
-            "column_count": columns[
-                "column_count"
-            ],
+            "height":
+                round_num(
+                    page_height
+                ),
 
-            "column_divider_x": columns[
-                "divider_x"
-            ],
+            "font_statistics":
+                font_stats,
 
-            "text_block_count": len(
-                text_elements
-            ),
+            "column_count":
+                columns[
+                    "column_count"
+                ],
 
-            "table_count": len(
-                table_structures
-            ),
+            "column_divider_x":
+                columns[
+                    "divider_x"
+                ],
 
-            "list_count": len(
-                detected_lists
-            ),
+            "text_block_count":
+                len(
+                    text_elements
+                ),
 
-            "drawing_count": len(
-                drawings
-            ),
+            "table_count":
+                len(
+                    table_structures
+                ),
 
-            "line_count": len(
-                lines
-            ),
+            "list_count":
+                len(
+                    detected_lists
+                ),
 
-            "horizontal_line_count": len(
-                horizontal_lines
-            ),
+            "drawing_count":
+                len(
+                    drawings
+                ),
 
-            "vertical_line_count": len(
-                vertical_lines
-            ),
+            "line_count":
+                len(
+                    lines
+                ),
 
-            "rectangle_count": len(
-                rectangles
-            ),
+            "horizontal_line_count":
+                len(
+                    horizontal_lines
+                ),
 
-            "form_line_count": len(
-                form_lines
-            ),
+            "vertical_line_count":
+                len(
+                    vertical_lines
+                ),
 
-            "tables": table_structures,
-            "lists": detected_lists,
-            "drawings": drawings,
-            "lines": lines,
-            "rectangles": rectangles,
-            "form_lines": form_lines,
-            "layout": layout_items
+            "rectangle_count":
+                len(
+                    rectangles
+                ),
+
+            "form_line_count":
+                len(
+                    form_lines
+                ),
+
+            "tables":
+                table_structures,
+
+            "lists":
+                detected_lists,
+
+            "drawings":
+                drawings,
+
+            "lines":
+                lines,
+
+            "rectangles":
+                rectangles,
+
+            "form_lines":
+                form_lines,
+
+            "layout":
+                layout_items
         })
 
     # ========================================================
@@ -1466,23 +2496,31 @@ def extract_pdf_structure(document):
         key=lambda item: int(
             item[
                 "id"
-            ].split("_")[1]
+            ].split(
+                "_"
+            )[1]
         )
     )
 
     translation_elements = []
 
     for element in elements:
+
         translation_elements.append({
-            "id": element[
-                "id"
-            ],
-            "type": element[
-                "type"
-            ],
-            "text": element[
-                "text"
-            ]
+            "id":
+                element[
+                    "id"
+                ],
+
+            "type":
+                element[
+                    "type"
+                ],
+
+            "text":
+                element[
+                    "text"
+                ]
         })
 
     chunks = [
@@ -1509,7 +2547,9 @@ def extract_pdf_structure(document):
 # TRANSLATION JSON
 # ============================================================
 
-def parse_translations(raw_value):
+def parse_translations(
+    raw_value
+):
     if raw_value is None:
         return {}
 
@@ -1517,8 +2557,10 @@ def parse_translations(raw_value):
         raw_value,
         bytes
     ):
-        raw_value = raw_value.decode(
-            "utf-8"
+        raw_value = (
+            raw_value.decode(
+                "utf-8"
+            )
         )
 
     if isinstance(
@@ -1539,6 +2581,7 @@ def parse_translations(raw_value):
     result = {}
 
     for item in translations:
+
         element_id = item.get(
             "id"
         )
@@ -1554,8 +2597,12 @@ def parse_translations(raw_value):
             text = ""
 
         result[
-            str(element_id)
-        ] = str(text)
+            str(
+                element_id
+            )
+        ] = str(
+            text
+        )
 
     return result
 
@@ -1593,13 +2640,19 @@ def set_cell_margins(
     end=60
 ):
     tc = cell._tc
-    tc_pr = tc.get_or_add_tcPr()
 
-    tc_mar = tc_pr.first_child_found_in(
-        "w:tcMar"
+    tc_pr = (
+        tc.get_or_add_tcPr()
+    )
+
+    tc_mar = (
+        tc_pr.first_child_found_in(
+            "w:tcMar"
+        )
     )
 
     if tc_mar is None:
+
         tc_mar = OxmlElement(
             "w:tcMar"
         )
@@ -1614,6 +2667,7 @@ def set_cell_margins(
         ("bottom", bottom),
         ("end", end)
     ]:
+
         node = tc_mar.find(
             qn(
                 f"w:{margin_name}"
@@ -1621,6 +2675,7 @@ def set_cell_margins(
         )
 
         if node is None:
+
             node = OxmlElement(
                 f"w:{margin_name}"
             )
@@ -1630,33 +2685,45 @@ def set_cell_margins(
             )
 
         node.set(
-            qn("w:w"),
+            qn(
+                "w:w"
+            ),
             str(
                 margin_value
             )
         )
 
         node.set(
-            qn("w:type"),
+            qn(
+                "w:type"
+            ),
             "dxa"
         )
 
 
-def prevent_row_split(row):
+def prevent_row_split(
+    row
+):
     try:
+
         tr_pr = (
             row._tr.get_or_add_trPr()
         )
 
-        cant_split = tr_pr.find(
-            qn(
-                "w:cantSplit"
+        cant_split = (
+            tr_pr.find(
+                qn(
+                    "w:cantSplit"
+                )
             )
         )
 
         if cant_split is None:
-            cant_split = OxmlElement(
-                "w:cantSplit"
+
+            cant_split = (
+                OxmlElement(
+                    "w:cantSplit"
+                )
             )
 
             tr_pr.append(
@@ -1664,7 +2731,9 @@ def prevent_row_split(row):
             )
 
         cant_split.set(
-            qn("w:val"),
+            qn(
+                "w:val"
+            ),
             "1"
         )
 
@@ -1672,9 +2741,14 @@ def prevent_row_split(row):
         pass
 
 
-def set_table_borders(table):
+def set_table_borders(
+    table
+):
     try:
-        tbl_pr = table._tbl.tblPr
+
+        tbl_pr = (
+            table._tbl.tblPr
+        )
 
         borders = (
             tbl_pr.first_child_found_in(
@@ -1683,8 +2757,11 @@ def set_table_borders(table):
         )
 
         if borders is None:
-            borders = OxmlElement(
-                "w:tblBorders"
+
+            borders = (
+                OxmlElement(
+                    "w:tblBorders"
+                )
             )
 
             tbl_pr.append(
@@ -1699,15 +2776,25 @@ def set_table_borders(table):
             "insideH",
             "insideV"
         ]:
-            tag = f"w:{edge}"
 
-            border = borders.find(
-                qn(tag)
+            tag = (
+                f"w:{edge}"
+            )
+
+            border = (
+                borders.find(
+                    qn(
+                        tag
+                    )
+                )
             )
 
             if border is None:
-                border = OxmlElement(
-                    tag
+
+                border = (
+                    OxmlElement(
+                        tag
+                    )
                 )
 
                 borders.append(
@@ -1715,22 +2802,30 @@ def set_table_borders(table):
                 )
 
             border.set(
-                qn("w:val"),
+                qn(
+                    "w:val"
+                ),
                 "single"
             )
 
             border.set(
-                qn("w:sz"),
+                qn(
+                    "w:sz"
+                ),
                 "4"
             )
 
             border.set(
-                qn("w:space"),
+                qn(
+                    "w:space"
+                ),
                 "0"
             )
 
             border.set(
-                qn("w:color"),
+                qn(
+                    "w:color"
+                ),
                 "808080"
             )
 
@@ -1740,10 +2835,6 @@ def set_table_borders(table):
 
 # ============================================================
 # BASIC WORD OUTPUT
-#
-# NOTE:
-# Bu bölüm henüz yeni form/style bilgilerinin tamamını
-# kullanmıyor. Önce extraction tarafını doğruluyoruz.
 # ============================================================
 
 def add_basic_text_block(
@@ -1758,19 +2849,27 @@ def add_basic_text_block(
     ]
 
     x0 = float(
-        bbox["x0"]
+        bbox[
+            "x0"
+        ]
     )
 
     y0 = float(
-        bbox["y0"]
+        bbox[
+            "y0"
+        ]
     )
 
     x1 = float(
-        bbox["x1"]
+        bbox[
+            "x1"
+        ]
     )
 
     y1 = float(
-        bbox["y1"]
+        bbox[
+            "y1"
+        ]
     )
 
     paragraph = (
@@ -1795,7 +2894,8 @@ def add_basic_text_block(
         vertical_gap = y0
     else:
         vertical_gap = (
-            y0 -
+            y0
+            -
             previous_bottom
         )
 
@@ -1885,7 +2985,11 @@ def add_basic_table(
         )
     )
 
-    if rows <= 0 or cols <= 0:
+    if (
+        rows <= 0
+        or
+        cols <= 0
+    ):
         return
 
     table = document.add_table(
@@ -1911,9 +3015,12 @@ def add_basic_table(
     for row_index in range(
         rows
     ):
-        word_row = table.rows[
-            row_index
-        ]
+
+        word_row = (
+            table.rows[
+                row_index
+            ]
+        )
 
         prevent_row_split(
             word_row
@@ -1922,9 +3029,12 @@ def add_basic_table(
         for col_index in range(
             cols
         ):
-            cell = word_row.cells[
-                col_index
-            ]
+
+            cell = (
+                word_row.cells[
+                    col_index
+                ]
+            )
 
             cell.vertical_alignment = (
                 WD_CELL_VERTICAL_ALIGNMENT.CENTER
@@ -1937,32 +3047,42 @@ def add_basic_table(
             info = None
 
             if (
-                row_index < len(
+                row_index
+                <
+                len(
                     row_data
                 )
                 and
-                col_index < len(
+                col_index
+                <
+                len(
                     row_data[
                         row_index
                     ]
                 )
             ):
-                info = row_data[
-                    row_index
-                ][
-                    col_index
-                ]
+                info = (
+                    row_data[
+                        row_index
+                    ][
+                        col_index
+                    ]
+                )
 
             if not info:
                 continue
 
-            element_id = info.get(
-                "id"
+            element_id = (
+                info.get(
+                    "id"
+                )
             )
 
-            original = info.get(
-                "text",
-                ""
+            original = (
+                info.get(
+                    "text",
+                    ""
+                )
             )
 
             translated = (
@@ -1974,9 +3094,9 @@ def add_basic_table(
                 else ""
             )
 
-            paragraph = cell.paragraphs[
-                0
-            ]
+            paragraph = (
+                cell.paragraphs[0]
+            )
 
             paragraph.paragraph_format.space_before = Pt(
                 0
@@ -2014,32 +3134,58 @@ def create_word_from_pdf(
     document = Document()
 
     element_lookup = {
-        element["id"]: element
+        element[
+            "id"
+        ]:
+        element
+
         for element in elements
     }
 
     if document.paragraphs:
-        p = document.paragraphs[0]
+
+        p = (
+            document.paragraphs[0]
+        )
+
         p.text = ""
-        p.paragraph_format.space_before = Pt(0)
-        p.paragraph_format.space_after = Pt(0)
+
+        p.paragraph_format.space_before = Pt(
+            0
+        )
+
+        p.paragraph_format.space_after = Pt(
+            0
+        )
 
     for page_index, page_data in enumerate(
         pages
     ):
+
         width = float(
-            page_data["width"]
+            page_data[
+                "width"
+            ]
         )
 
         height = float(
-            page_data["height"]
+            page_data[
+                "height"
+            ]
         )
 
         if page_index == 0:
-            section = document.sections[0]
+
+            section = (
+                document.sections[0]
+            )
+
         else:
-            section = document.add_section(
-                WD_SECTION.NEW_PAGE
+
+            section = (
+                document.add_section(
+                    WD_SECTION.NEW_PAGE
+                )
             )
 
         configure_section(
@@ -2049,7 +3195,11 @@ def create_word_from_pdf(
         )
 
         table_lookup = {
-            table["table_id"]: table
+            table[
+                "table_id"
+            ]:
+            table
+
             for table in page_data.get(
                 "tables",
                 []
@@ -2062,20 +3212,29 @@ def create_word_from_pdf(
             "layout",
             []
         ):
-            item_type = item.get(
-                "type"
+
+            item_type = (
+                item.get(
+                    "type"
+                )
             )
 
             if item_type == "table":
-                table_id = item.get(
-                    "table_id"
+
+                table_id = (
+                    item.get(
+                        "table_id"
+                    )
                 )
 
-                table_data = table_lookup.get(
-                    table_id
+                table_data = (
+                    table_lookup.get(
+                        table_id
+                    )
                 )
 
                 if table_data:
+
                     add_basic_table(
                         document,
                         table_data,
@@ -2092,12 +3251,16 @@ def create_word_from_pdf(
 
                 continue
 
-            element_id = item.get(
-                "id"
+            element_id = (
+                item.get(
+                    "id"
+                )
             )
 
-            element = element_lookup.get(
-                element_id
+            element = (
+                element_lookup.get(
+                    element_id
+                )
             )
 
             if not element:
@@ -2129,7 +3292,9 @@ def create_word_from_pdf(
         output
     )
 
-    output.seek(0)
+    output.seek(
+        0
+    )
 
     return output
 
@@ -2143,17 +3308,22 @@ def create_word_from_pdf(
     methods=["POST"]
 )
 def extract_pdf():
+
     if "file" not in request.files:
+
         return jsonify({
             "error":
                 "No PDF file received"
         }), 400
 
     uploaded_file = (
-        request.files["file"]
+        request.files[
+            "file"
+        ]
     )
 
     try:
+
         pdf_bytes = (
             uploaded_file.read()
         )
@@ -2164,14 +3334,17 @@ def extract_pdf():
         )
 
     except Exception as e:
+
         return jsonify({
             "error":
                 "Could not read PDF file",
+
             "details":
                 str(e)
         }), 400
 
     try:
+
         (
             pages,
             elements,
@@ -2225,16 +3398,22 @@ def extract_pdf():
                 uploaded_file.filename,
 
             "page_count":
-                len(pages),
+                len(
+                    pages
+                ),
 
             "element_count":
-                len(elements),
+                len(
+                    elements
+                ),
 
             "chunk_size":
                 CHUNK_SIZE,
 
             "chunk_count":
-                len(chunks),
+                len(
+                    chunks
+                ),
 
             "table_count":
                 table_count,
@@ -2266,6 +3445,7 @@ def extract_pdf():
         )
 
     finally:
+
         document.close()
 
 
@@ -2278,14 +3458,18 @@ def extract_pdf():
     methods=["POST"]
 )
 def create_docx():
+
     if "file" not in request.files:
+
         return jsonify({
             "error":
                 "No PDF file received"
         }), 400
 
     uploaded_file = (
-        request.files["file"]
+        request.files[
+            "file"
+        ]
     )
 
     translations_raw = (
@@ -2295,12 +3479,14 @@ def create_docx():
     )
 
     if not translations_raw:
+
         return jsonify({
             "error":
                 "No translations JSON received"
         }), 400
 
     try:
+
         translations = (
             parse_translations(
                 translations_raw
@@ -2308,20 +3494,24 @@ def create_docx():
         )
 
     except Exception as e:
+
         return jsonify({
             "error":
                 "Could not parse translations JSON",
+
             "details":
                 str(e)
         }), 400
 
     if not translations:
+
         return jsonify({
             "error":
                 "Translations list is empty"
         }), 400
 
     try:
+
         pdf_bytes = (
             uploaded_file.read()
         )
@@ -2332,14 +3522,17 @@ def create_docx():
         )
 
     except Exception as e:
+
         return jsonify({
             "error":
                 "Could not read original PDF",
+
             "details":
                 str(e)
         }), 400
 
     try:
+
         word_file = (
             create_word_from_pdf(
                 pdf_document,
@@ -2348,14 +3541,17 @@ def create_docx():
         )
 
     except Exception as e:
+
         return jsonify({
             "error":
                 "Could not create DOCX",
+
             "details":
                 str(e)
         }), 500
 
     finally:
+
         pdf_document.close()
 
     original_name = (
@@ -2367,6 +3563,7 @@ def create_docx():
     if original_name.lower().endswith(
         ".pdf"
     ):
+
         original_name = (
             original_name[:-4]
         )
@@ -2380,7 +3577,8 @@ def create_docx():
         as_attachment=True,
         download_name=output_filename,
         mimetype=(
-            "application/vnd.openxmlformats-officedocument."
+            "application/"
+            "vnd.openxmlformats-officedocument."
             "wordprocessingml.document"
         )
     )
