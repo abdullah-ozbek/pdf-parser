@@ -1763,6 +1763,14 @@ def attach_form_label_translation_elements(
         field["label_helper_sources"] = [
             record.get("text", "") for record in helpers
         ]
+        # Keep the exact helper rectangles as claimed form text as well.
+        # Without this, the same source helper line can be rendered twice:
+        # once inside the form field and again by the generic unclaimed-text
+        # fallback. This showed up as duplicate translations of the same
+        # parenthetical helper text.
+        field["label_helper_bboxes"] = [
+            record.get("bbox", {}) for record in helpers
+        ]
 
     return element_counter
 
@@ -2729,15 +2737,26 @@ def get_form_label_bboxes(page_data):
         [],
     ):
         bbox = field.get("label_bbox")
-        if not bbox:
-            continue
+        if bbox:
+            result.append((
+                float(bbox.get("x0", 0)),
+                float(bbox.get("y0", 0)),
+                float(bbox.get("x1", 0)),
+                float(bbox.get("y1", 0)),
+            ))
 
-        result.append((
-            float(bbox.get("x0", 0)),
-            float(bbox.get("y0", 0)),
-            float(bbox.get("x1", 0)),
-            float(bbox.get("y1", 0)),
-        ))
+        # Helper text belongs to the field just as much as the primary label.
+        # Mark it as consumed so form_element_line_events() cannot emit the
+        # same visual line again as an unclaimed fallback event.
+        for helper_bbox in field.get("label_helper_bboxes", []) or []:
+            if not helper_bbox:
+                continue
+            result.append((
+                float(helper_bbox.get("x0", 0)),
+                float(helper_bbox.get("y0", 0)),
+                float(helper_bbox.get("x1", 0)),
+                float(helper_bbox.get("y1", 0)),
+            ))
 
     return result
 
@@ -3234,15 +3253,16 @@ def add_form_row(
             run.font.size = Pt(FORM_DOCX_FONT_PT)
             apply_hex_font_color(run, field.get("label_color", "#000000"))
 
-            # Explanatory text that visually belongs to the same PDF field is
-            # kept directly with the field label instead of being emitted as
-            # an unrelated paragraph elsewhere on the page.
+            # Keep helper text in the SAME paragraph as the primary label.
+            # Separate helper paragraphs make short form rows much taller and
+            # can push only part of a three-column row onto the next Word page
+            # near the bottom of the source PDF. A line break preserves the
+            # visual hierarchy while keeping the complete field compact.
             for helper_text in helper_labels:
-                helper_p = p._parent.add_paragraph()
-                _configure(helper_p)
-                helper_run = helper_p.add_run(helper_text)
+                run.add_break()
+                helper_run = p.add_run(helper_text)
                 helper_run.font.name = DEFAULT_FONT_NAME
-                helper_run.font.size = Pt(max(6.5, FORM_DOCX_FONT_PT - 0.5))
+                helper_run.font.size = Pt(max(6.25, FORM_DOCX_FONT_PT - 0.75))
                 apply_hex_font_color(
                     helper_run, field.get("label_color", "#000000")
                 )
