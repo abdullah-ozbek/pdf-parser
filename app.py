@@ -123,6 +123,15 @@ HEADER_CONTACT_REGEX = re.compile(
     re.IGNORECASE,
 )
 
+# Generic form labels can contain words such as "Straße" or "E-Mail".
+# Those are not letterheads and must never be promoted into a Word header.
+HEADER_FORM_LABEL_REGEX = re.compile(
+    r"(straße\s*,?\s*hausnr|strasse\s*,?\s*hausnr|plz\s*,?\s*ort|"
+    r"geburtsdatum|vorname|akademischer\s+grad|kundennummer|förderstelle|"
+    r"foerderstelle|teilnehmer/?-?in|anmeldung)",
+    re.IGNORECASE,
+)
+
 # ============================================================
 # ROOT
 # ============================================================
@@ -1444,6 +1453,7 @@ def block_is_header(block, page_height, repeated_header_signatures):
 
     if (
         HEADER_CONTACT_REGEX.search(text)
+        and not HEADER_FORM_LABEL_REGEX.search(text)
         and block_height_ratio <= HEADER_UNIQUE_MAX_HEIGHT_RATIO
         and len(text) <= HEADER_UNIQUE_MAX_TEXT_LENGTH
         and line_count <= HEADER_UNIQUE_MAX_LINES
@@ -2906,13 +2916,18 @@ def clear_header(header):
 
 
 def add_page_header(section, page_data, element_lookup, translations, rendered_ids):
-    header_items = page_data.get("header_blocks", [])
-    if not header_items:
-        return
-
+    # Every PDF page is rendered into its own Word section. A newly-created
+    # Word section inherits the previous section's header by default. If this
+    # PDF page has no header and we return before unlinking/clearing it, Word
+    # repeats the previous page's header on this and every overflow page.
+    # Always break that inheritance first, even when header_items is empty.
     header = section.header
     header.is_linked_to_previous = False
     clear_header(header)
+
+    header_items = page_data.get("header_blocks", [])
+    if not header_items:
+        return
 
     for item in sorted(
         header_items,
@@ -2964,13 +2979,16 @@ def add_page_footer(
     translations,
     rendered_ids,
 ):
-    footer_items = page_data.get("footer_blocks", [])
-    if not footer_items:
-        return
-
+    # Same rule as headers: new Word sections inherit the previous footer.
+    # Break the link and clear it before checking whether this PDF page has
+    # footer content.
     footer = section.footer
     footer.is_linked_to_previous = False
     clear_footer(footer)
+
+    footer_items = page_data.get("footer_blocks", [])
+    if not footer_items:
+        return
 
     sorted_items = sorted(
         footer_items,
