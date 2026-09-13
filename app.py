@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import fitz
-from io import BytesIO
 
 
 app = Flask(__name__)
@@ -43,16 +42,11 @@ def extract_pdf():
 
     element_counter = 1
 
-    for page_index in range(
-        len(document)
-    ):
-        page = document[
-            page_index
-        ]
+    for page_index in range(len(document)):
 
-        blocks = page.get_text(
-            "blocks"
-        )
+        page = document[page_index]
+
+        blocks = page.get_text("blocks")
 
         page_elements = []
 
@@ -83,29 +77,16 @@ def extract_pdf():
                 }
             }
 
-            elements.append(
-                element
-            )
-
-            page_elements.append(
-                element
-            )
+            elements.append(element)
+            page_elements.append(element)
 
             element_counter += 1
 
         pages.append({
             "page": page_index + 1,
-            "width": round(
-                page.rect.width,
-                2
-            ),
-            "height": round(
-                page.rect.height,
-                2
-            ),
-            "element_count": len(
-                page_elements
-            ),
+            "width": round(page.rect.width, 2),
+            "height": round(page.rect.height, 2),
+            "element_count": len(page_elements),
             "elements": page_elements
         })
 
