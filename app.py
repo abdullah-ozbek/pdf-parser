@@ -11,7 +11,6 @@ import time
 import uuid
 from difflib import SequenceMatcher
 
-
 from io import BytesIO
 
 from docx import Document
@@ -677,6 +676,55 @@ def find_vertical_boundaries(field_line, vertical_lines):
         "right_border": right_border,
         "internal_borders": sorted(list(set(internal_borders))),
     }
+
+
+def split_form_lines_by_internal_verticals(form_lines, vertical_lines):
+    """Split a visually continuous form underline into real column fields.
+
+    Some PDFs draw a three-column form row as one long horizontal stroke and
+    use vertical separators for the column boundaries.  Treating that stroke
+    as one field makes the middle label disappear.  Split only when there are
+    at least two strong internal separators and every resulting segment is a
+    plausible writing field.  This is geometry-only and language-agnostic.
+    """
+    result = []
+    for line in form_lines:
+        x0 = min(float(line.get("x0", 0)), float(line.get("x1", 0)))
+        x1 = max(float(line.get("x0", 0)), float(line.get("x1", 0)))
+        y = float(line.get("y0", 0))
+        info = find_vertical_boundaries(line, vertical_lines)
+        borders = [
+            float(x) for x in (info.get("internal_borders", []) or [])
+            if x0 + FORM_MIN_FIELD_WIDTH <= float(x) <= x1 - FORM_MIN_FIELD_WIDTH
+        ]
+        borders = sorted(set(borders))
+
+        # One separator can easily be decorative. Two or more separators are
+        # strong evidence of a multi-column form row.
+        if len(borders) < 2:
+            result.append(line)
+            continue
+
+        cuts = [x0] + borders + [x1]
+        segments = []
+        valid = True
+        for idx in range(len(cuts) - 1):
+            sx0, sx1 = cuts[idx], cuts[idx + 1]
+            if sx1 - sx0 < FORM_MIN_FIELD_WIDTH:
+                valid = False
+                break
+            seg = dict(line)
+            seg["x0"] = round_num(sx0)
+            seg["x1"] = round_num(sx1)
+            seg["y0"] = round_num(y)
+            seg["y1"] = round_num(float(line.get("y1", y)))
+            seg["id"] = f"{line.get('id', 'formline')}_seg{idx + 1}"
+            seg["source"] = f"{line.get('source', 'drawing')}:column_segment"
+            segments.append(seg)
+
+        result.extend(segments if valid and len(segments) >= 3 else [line])
+
+    return result
 
 
 def find_form_label(field_line, raw_blocks):
@@ -1776,6 +1824,109 @@ def attach_form_label_translation_elements(
     return element_counter
 
 
+
+def recover_unlabeled_form_fields(form_fields, raw_blocks):
+    """Recover labels for detected writing lines that lost their text association.
+
+    Some PDFs draw a complete field line but place its label in a separate text
+    object that the first-pass nearest-label matcher misses.  This commonly
+    happens in dense three-column rows near the bottom of a form.  Recovery is
+    language-agnostic: it uses only x-overlap, left-edge alignment and vertical
+    proximity, and it never steals a line already claimed by another field.
+    """
+    if not form_fields:
+        return
+
+    claimed = []
+    for field in form_fields:
+        bbox = field.get("label_bbox")
+        if bbox:
+            claimed.append((
+                float(bbox.get("x0", 0)), float(bbox.get("y0", 0)),
+                float(bbox.get("x1", 0)), float(bbox.get("y1", 0)),
+            ))
+
+    candidates = []
+    for block in raw_blocks:
+        block_bbox = block.get("bbox", {})
+        for line_index, line in enumerate(block.get("lines", []) or []):
+            text = clean_text(line.get("text", ""))
+            if not text:
+                text = clean_text("".join(
+                    span.get("text", "")
+                    for span in (line.get("spans", []) or [])
+                ))
+            if not text or line_is_form_section_heading(line):
+                continue
+            bbox = line.get("bbox") or block_bbox
+            rect = (
+                float(bbox.get("x0", 0)), float(bbox.get("y0", 0)),
+                float(bbox.get("x1", 0)), float(bbox.get("y1", 0)),
+            )
+            if any(max(bbox_overlap_ratio(rect, c), _rect_metrics(rect, c)[1]) >= 0.80 for c in claimed):
+                continue
+            spans = line.get("spans", []) or []
+            color = "#000000"
+            if spans:
+                try:
+                    color = int_to_hex_color(spans[0].get("color", 0))
+                except Exception:
+                    pass
+            candidates.append({
+                "text": text, "bbox": bbox, "line_index": line_index,
+                "source_block_bbox": block_bbox, "color": color,
+            })
+
+    for field in form_fields:
+        if clean_text(field.get("label", "")) and field.get("label_bbox"):
+            continue
+
+        fx0 = float(field.get("x0", 0))
+        fx1 = float(field.get("x1", fx0))
+        fy = float(field.get("y", 0))
+        fwidth = max(1.0, fx1 - fx0)
+
+        best = None
+        best_score = -1e9
+        for cand in candidates:
+            bbox = cand["bbox"]
+            bx0 = float(bbox.get("x0", 0))
+            bx1 = float(bbox.get("x1", bx0))
+            by0 = float(bbox.get("y0", 0))
+            by1 = float(bbox.get("y1", by0))
+            # Labels are normally immediately above or below a writing line.
+            vdist = min(abs(by0 - fy), abs(by1 - fy))
+            if vdist > 18.0:
+                continue
+            overlap = horizontal_overlap(fx0 - 2.0, fx1 + 2.0, bx0, bx1)
+            cand_width = max(1.0, bx1 - bx0)
+            overlap_ratio = overlap / min(fwidth, cand_width)
+            if overlap_ratio < 0.45:
+                continue
+            left_delta = abs(bx0 - fx0)
+            # Strong preference for same-column left alignment and proximity.
+            score = (overlap_ratio * 100.0) - (vdist * 3.0) - min(left_delta, 30.0)
+            if score > best_score:
+                best_score = score
+                best = cand
+
+        if best is None:
+            continue
+
+        field["label"] = best["text"]
+        field["label_bbox"] = best["bbox"]
+        field["label_line_index"] = best["line_index"]
+        field["label_source_block_bbox"] = best["source_block_bbox"]
+        field["label_color"] = best["color"]
+        field["label_position"] = classify_label_position(best["bbox"], fy)
+        rect = (
+            float(best["bbox"].get("x0", 0)), float(best["bbox"].get("y0", 0)),
+            float(best["bbox"].get("x1", 0)), float(best["bbox"].get("y1", 0)),
+        )
+        claimed.append(rect)
+        candidates.remove(best)
+
+
 # ============================================================
 # MAIN EXTRACTION
 # ============================================================
@@ -1816,6 +1967,14 @@ def extract_pdf_structure(document):
             horizontal_lines,
             page_width,
         )
+        # Recover true column fields when a PDF represents a multi-column row
+        # as one long underline plus vertical separators. This must happen
+        # before label matching so every column, including the middle one,
+        # receives its own label and translation id.
+        form_lines = split_form_lines_by_internal_verticals(
+            form_lines,
+            vertical_lines,
+        )
 
         raw_blocks = extract_raw_text_blocks(page)
         raw_blocks, suppressed_spatial_duplicates = suppress_spatial_duplicate_blocks(
@@ -1845,6 +2004,11 @@ def extract_pdf_structure(document):
         form_fields = form_structure["fields"]
         form_rows = form_structure["rows"]
         form_columns = form_structure["columns"]
+
+        # A complete writing line may exist even when the first label matcher
+        # misses the nearby text object. Recover such labels geometrically
+        # before translation ids are assigned.
+        recover_unlabeled_form_fields(form_fields, raw_blocks)
 
         detected_tables = find_page_tables(page)
         table_regions = []
@@ -2972,6 +3136,20 @@ def add_form_heading_block(
         6.5,
         12.0,
     )
+
+    # Keep compact form section headings on one line whenever the source
+    # heading itself occupied one line.  Translation often expands text by
+    # 20–40%; allowing Word to wrap it increases the form height and can push
+    # the last fields onto another page.  Estimate rendered width and shrink
+    # only as much as needed, with a conservative floor for readability.
+    source_line_count = len(element.get("lines", []) or [])
+    available_width = max(24.0, x1 - x0)
+    if source_line_count <= 1 and translated_text and "\n" not in translated_text:
+        avg_char_em = 0.50
+        estimated_width = len(translated_text) * font_size * avg_char_em
+        if estimated_width > available_width:
+            fitted = available_width / max(1.0, len(translated_text) * avg_char_em)
+            font_size = clamp(fitted, 5.5, font_size)
 
     run.font.name = (
         style.get(
