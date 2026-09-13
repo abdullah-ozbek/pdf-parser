@@ -2445,12 +2445,87 @@ def add_basic_table(
 # ============================================================
 
 def page_is_form_page(page_data):
-    return (
-        ENABLE_FORM_DOCX_REBUILD
-        and page_data.get("table_count", 0) == 0
-        and page_data.get("form_field_count", 0) >= FORM_PAGE_MIN_FIELDS
-        and page_data.get("form_row_count", 0) >= FORM_PAGE_MIN_ROWS
+    """Return True only for pages with a real repeated form grid.
+
+    A few horizontal rules on a normal multi-column/legal page must not be
+    enough to switch the whole page into the form renderer.  The previous
+    fallback could therefore misclassify dense text pages and explode the
+    document into many broken pages.  We now require repeated multi-field
+    rows, repeated columns and a reasonable amount of label evidence in
+    addition to the existing field/row thresholds.
+    """
+    if not ENABLE_FORM_DOCX_REBUILD:
+        return False
+    if page_data.get("table_count", 0) != 0:
+        return False
+
+    fields = page_data.get("form_fields", []) or []
+    rows = page_data.get("form_rows", []) or []
+    columns = page_data.get("form_columns", []) or []
+
+    if len(fields) < FORM_PAGE_MIN_FIELDS or len(rows) < FORM_PAGE_MIN_ROWS:
+        return False
+
+    multi_field_rows = sum(
+        1 for row in rows
+        if int(row.get("field_count", len(row.get("field_ids", []) or []))) >= 2
     )
+    repeated_columns = sum(
+        1 for column in columns
+        if int(column.get("field_count", len(column.get("field_ids", []) or []))) >= 3
+    )
+    labeled_fields = sum(
+        1 for field in fields
+        if clean_text(field.get("label", ""))
+    )
+    label_ratio = labeled_fields / max(1, len(fields))
+
+    return (
+        multi_field_rows >= 3
+        and repeated_columns >= 2
+        and label_ratio >= 0.45
+    )
+
+
+def get_form_render_region(page_data):
+    """Bounding region in which form-specific fallback is allowed.
+
+    This deliberately derives the region from detected field geometry rather
+    than from page numbers, words or fixed coordinates.  Structural headings
+    immediately above a form group are included with a modest top margin,
+    while unrelated text elsewhere on the page keeps the normal renderer.
+    """
+    fields = page_data.get("form_fields", []) or []
+    if not fields:
+        return None
+
+    x0 = min(float(field.get("x0", 0)) for field in fields)
+    x1 = max(float(field.get("x1", 0)) for field in fields)
+    y0 = min(float(field.get("y", 0)) for field in fields)
+    y1 = max(float(field.get("y", 0)) for field in fields)
+
+    page_width = float(page_data.get("width", x1) or x1)
+    page_height = float(page_data.get("height", y1 + 50) or (y1 + 50))
+
+    return (
+        max(0.0, x0 - 18.0),
+        max(0.0, y0 - 72.0),
+        min(page_width, x1 + 18.0),
+        min(page_height, y1 + 48.0),
+    )
+
+
+def bbox_center_inside_region(bbox, region):
+    if not bbox or not region:
+        return False
+    x0 = float(bbox.get("x0", 0))
+    y0 = float(bbox.get("y0", 0))
+    x1 = float(bbox.get("x1", x0))
+    y1 = float(bbox.get("y1", y0))
+    cx = (x0 + x1) / 2.0
+    cy = (y0 + y1) / 2.0
+    rx0, ry0, rx1, ry1 = region
+    return rx0 <= cx <= rx1 and ry0 <= cy <= ry1
 
 
 def get_form_label_bboxes(page_data):
@@ -2979,6 +3054,7 @@ def build_form_page_events(
     label_bboxes = get_form_label_bboxes(
         page_data
     )
+    form_region = get_form_render_region(page_data)
 
     events = []
 
@@ -2995,9 +3071,19 @@ def build_form_page_events(
         # may contain one detected field label plus unrelated structural text
         # (section headings, place/location labels, instructions). Earlier
         # code discarded the whole block as soon as one label overlapped it.
-        line_events = form_element_line_events(
-            element,
-            label_bboxes,
+        element_bbox = element.get("bbox", {})
+        allow_form_fallback = bbox_center_inside_region(
+            element_bbox,
+            form_region,
+        )
+
+        line_events = (
+            form_element_line_events(
+                element,
+                label_bboxes,
+            )
+            if allow_form_fallback
+            else []
         )
 
         if line_events:
