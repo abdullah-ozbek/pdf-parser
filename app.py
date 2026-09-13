@@ -1,6 +1,9 @@
 from flask import Flask, request, jsonify, send_file
+
 import fitz
 import json
+import re
+import statistics
 
 from io import BytesIO
 
@@ -24,13 +27,24 @@ CHUNK_SIZE = 40
 
 DEFAULT_FONT_NAME = "Arial"
 DEFAULT_FONT_SIZE = 10
-
 TABLE_FONT_SIZE = 9
 
 MIN_VERTICAL_GAP_PT = 0
 MAX_VERTICAL_GAP_PT = 40
 
 ENABLE_TABLE_DETECTION = True
+ENABLE_DRAWING_DETECTION = True
+ENABLE_LIST_DETECTION = True
+ENABLE_STYLE_DETECTION = True
+ENABLE_COLUMN_DETECTION = True
+
+HEADING_SIZE_RATIO = 1.18
+HEADING_LARGE_RATIO = 1.45
+
+COLUMN_MIN_BLOCKS = 4
+COLUMN_GAP_RATIO = 0.08
+
+LINE_TOLERANCE = 1.5
 
 
 # ============================================================
@@ -41,7 +55,7 @@ ENABLE_TABLE_DETECTION = True
 def home():
     return {
         "status": "ok",
-        "service": "PDF Parser"
+        "service": "PDF Structure Parser"
     }
 
 
@@ -50,39 +64,28 @@ def home():
 # ============================================================
 
 def clamp(value, minimum, maximum):
-    return max(
-        minimum,
-        min(
-            maximum,
-            value
-        )
-    )
+    return max(minimum, min(maximum, value))
 
 
-def rects_intersect(rect1, rect2):
-    """
-    rect = (x0, y0, x1, y1)
-    """
+def round_num(value):
+    try:
+        return round(float(value), 2)
+    except Exception:
+        return 0.0
 
-    return not (
-        rect1[2] <= rect2[0]
-        or rect1[0] >= rect2[2]
-        or rect1[3] <= rect2[1]
-        or rect1[1] >= rect2[3]
-    )
+
+def bbox_dict(rect):
+    return {
+        "x0": round_num(rect[0]),
+        "y0": round_num(rect[1]),
+        "x1": round_num(rect[2]),
+        "y1": round_num(rect[3])
+    }
 
 
 def rect_center_inside(inner_rect, outer_rect):
-
-    cx = (
-        inner_rect[0] +
-        inner_rect[2]
-    ) / 2
-
-    cy = (
-        inner_rect[1] +
-        inner_rect[3]
-    ) / 2
+    cx = (inner_rect[0] + inner_rect[2]) / 2
+    cy = (inner_rect[1] + inner_rect[3]) / 2
 
     return (
         outer_rect[0] <= cx <= outer_rect[2]
@@ -91,12 +94,399 @@ def rect_center_inside(inner_rect, outer_rect):
     )
 
 
+def rects_intersect(a, b):
+    return not (
+        a[2] <= b[0]
+        or a[0] >= b[2]
+        or a[3] <= b[1]
+        or a[1] >= b[3]
+    )
+
+
+def clean_text(value):
+    if value is None:
+        return ""
+
+    value = str(value)
+
+    value = value.replace("\u00ad", "")
+    value = value.replace("\u00a0", " ")
+
+    return value.strip()
+
+
 # ============================================================
-# TABLE HELPERS
+# FONT / STYLE HELPERS
+# ============================================================
+
+def rgb_from_int(color_value):
+    try:
+        color_value = int(color_value)
+
+        r = (color_value >> 16) & 255
+        g = (color_value >> 8) & 255
+        b = color_value & 255
+
+        return {
+            "r": r,
+            "g": g,
+            "b": b,
+            "hex": f"#{r:02X}{g:02X}{b:02X}"
+        }
+
+    except Exception:
+        return {
+            "r": 0,
+            "g": 0,
+            "b": 0,
+            "hex": "#000000"
+        }
+
+
+def span_is_bold(span):
+    flags = int(span.get("flags", 0))
+    font = str(span.get("font", "")).lower()
+
+    return (
+        bool(flags & 16)
+        or
+        "bold" in font
+        or
+        "black" in font
+        or
+        "heavy" in font
+        or
+        "semibold" in font
+        or
+        "demi" in font
+    )
+
+
+def span_is_italic(span):
+    flags = int(span.get("flags", 0))
+    font = str(span.get("font", "")).lower()
+
+    return (
+        bool(flags & 2)
+        or
+        "italic" in font
+        or
+        "oblique" in font
+    )
+
+
+def span_is_monospace(span):
+    flags = int(span.get("flags", 0))
+
+    return bool(flags & 8)
+
+
+def span_is_serif(span):
+    flags = int(span.get("flags", 0))
+
+    return bool(flags & 4)
+
+
+def normalize_span(span):
+    bbox = span.get("bbox", (0, 0, 0, 0))
+
+    return {
+        "text": clean_text(span.get("text", "")),
+        "font": str(span.get("font", "")),
+        "size": round_num(span.get("size", 0)),
+        "bold": span_is_bold(span),
+        "italic": span_is_italic(span),
+        "monospace": span_is_monospace(span),
+        "serif": span_is_serif(span),
+        "color": rgb_from_int(span.get("color", 0)),
+        "bbox": bbox_dict(bbox)
+    }
+
+
+def get_block_style(spans):
+    valid_spans = [
+        span
+        for span in spans
+        if span.get("text")
+    ]
+
+    if not valid_spans:
+        return {
+            "font": "",
+            "size": 0,
+            "max_size": 0,
+            "bold": False,
+            "italic": False,
+            "color": "#000000"
+        }
+
+    sizes = [
+        float(span.get("size", 0))
+        for span in valid_spans
+        if float(span.get("size", 0)) > 0
+    ]
+
+    fonts = [
+        span.get("font", "")
+        for span in valid_spans
+        if span.get("font")
+    ]
+
+    colors = [
+        span.get("color", {}).get("hex", "#000000")
+        for span in valid_spans
+    ]
+
+    font = ""
+
+    if fonts:
+        try:
+            font = statistics.mode(fonts)
+        except Exception:
+            font = fonts[0]
+
+    color = "#000000"
+
+    if colors:
+        try:
+            color = statistics.mode(colors)
+        except Exception:
+            color = colors[0]
+
+    return {
+        "font": font,
+        "size": round_num(statistics.median(sizes)) if sizes else 0,
+        "max_size": round_num(max(sizes)) if sizes else 0,
+        "bold": any(span.get("bold") for span in valid_spans),
+        "italic": any(span.get("italic") for span in valid_spans),
+        "color": color
+    }
+
+
+# ============================================================
+# LIST DETECTION
+# ============================================================
+
+BULLET_REGEX = re.compile(
+    r"^\s*("
+    r"[•●▪◦‣⁃·]"
+    r"|[\uF0B7]"
+    r"|[-–—]"
+    r")\s+"
+)
+
+NUMBER_LIST_REGEX = re.compile(
+    r"^\s*("
+    r"\d+[\.\)]"
+    r"|\(\d+\)"
+    r"|[a-zA-Z][\.\)]"
+    r"|\([a-zA-Z]\)"
+    r")\s+"
+)
+
+
+def detect_list_info(text):
+    if not ENABLE_LIST_DETECTION:
+        return None
+
+    if not text:
+        return None
+
+    first_line = text.splitlines()[0].strip()
+
+    bullet_match = BULLET_REGEX.match(first_line)
+
+    if bullet_match:
+        return {
+            "is_list": True,
+            "list_type": "bullet",
+            "marker": bullet_match.group(1)
+        }
+
+    number_match = NUMBER_LIST_REGEX.match(first_line)
+
+    if number_match:
+        return {
+            "is_list": True,
+            "list_type": "numbered",
+            "marker": number_match.group(1)
+        }
+
+    return None
+
+
+# ============================================================
+# DRAWING / LINE DETECTION
+# ============================================================
+
+def point_xy(point):
+    try:
+        return float(point.x), float(point.y)
+    except Exception:
+        try:
+            return float(point[0]), float(point[1])
+        except Exception:
+            return 0.0, 0.0
+
+
+def normalize_drawings(page):
+    if not ENABLE_DRAWING_DETECTION:
+        return [], [], []
+
+    drawings_out = []
+    lines_out = []
+    rectangles_out = []
+
+    try:
+        drawings = page.get_drawings()
+    except Exception as e:
+        print("get_drawings error:", str(e))
+        return [], [], []
+
+    drawing_counter = 1
+    line_counter = 1
+    rect_counter = 1
+
+    for drawing in drawings:
+        drawing_bbox = drawing.get("rect")
+
+        drawing_data = {
+            "id": f"drawing_{drawing_counter}",
+            "type": "drawing",
+            "bbox": (
+                bbox_dict(drawing_bbox)
+                if drawing_bbox is not None
+                else None
+            ),
+            "fill": str(drawing.get("fill")),
+            "color": str(drawing.get("color")),
+            "width": round_num(drawing.get("width", 0))
+        }
+
+        drawing_counter += 1
+
+        drawing_items = []
+
+        for item in drawing.get("items", []):
+            if not item:
+                continue
+
+            command = item[0]
+
+            # ------------------------------------------------
+            # LINE
+            # ------------------------------------------------
+
+            if command == "l" and len(item) >= 3:
+                x0, y0 = point_xy(item[1])
+                x1, y1 = point_xy(item[2])
+
+                horizontal = abs(y1 - y0) <= LINE_TOLERANCE
+                vertical = abs(x1 - x0) <= LINE_TOLERANCE
+
+                orientation = "diagonal"
+
+                if horizontal:
+                    orientation = "horizontal"
+
+                elif vertical:
+                    orientation = "vertical"
+
+                line = {
+                    "id": f"line_{line_counter}",
+                    "type": "line",
+                    "x0": round_num(x0),
+                    "y0": round_num(y0),
+                    "x1": round_num(x1),
+                    "y1": round_num(y1),
+                    "orientation": orientation,
+                    "length": round_num(
+                        ((x1 - x0) ** 2 + (y1 - y0) ** 2) ** 0.5
+                    ),
+                    "width": round_num(drawing.get("width", 0))
+                }
+
+                line_counter += 1
+                lines_out.append(line)
+                drawing_items.append(line)
+
+            # ------------------------------------------------
+            # RECTANGLE
+            # ------------------------------------------------
+
+            elif command == "re" and len(item) >= 2:
+                rect = item[1]
+
+                try:
+                    rect_tuple = (
+                        float(rect.x0),
+                        float(rect.y0),
+                        float(rect.x1),
+                        float(rect.y1)
+                    )
+
+                    rect_data = {
+                        "id": f"rect_{rect_counter}",
+                        "type": "rectangle",
+                        "bbox": bbox_dict(rect_tuple),
+                        "width": round_num(
+                            rect_tuple[2] - rect_tuple[0]
+                        ),
+                        "height": round_num(
+                            rect_tuple[3] - rect_tuple[1]
+                        )
+                    }
+
+                    rect_counter += 1
+                    rectangles_out.append(rect_data)
+                    drawing_items.append(rect_data)
+
+                except Exception:
+                    pass
+
+        drawing_data["items"] = drawing_items
+
+        if drawing_items:
+            drawings_out.append(drawing_data)
+
+    return (
+        drawings_out,
+        lines_out,
+        rectangles_out
+    )
+
+
+# ============================================================
+# FORM LINE DETECTION
+# ============================================================
+
+def detect_form_lines(lines, page_width):
+    form_lines = []
+
+    minimum_form_line = page_width * 0.08
+    maximum_form_line = page_width * 0.80
+
+    for line in lines:
+        if line.get("orientation") != "horizontal":
+            continue
+
+        length = float(line.get("length", 0))
+
+        if (
+            length >= minimum_form_line
+            and
+            length <= maximum_form_line
+        ):
+            form_lines.append(line)
+
+    return form_lines
+
+
+# ============================================================
+# TABLE DETECTION
 # ============================================================
 
 def find_page_tables(page):
-
     if not ENABLE_TABLE_DETECTION:
         return []
 
@@ -106,21 +496,14 @@ def find_page_tables(page):
         if finder is None:
             return []
 
-        return list(
-            finder.tables
-        )
+        return list(finder.tables)
 
     except Exception as e:
-        print(
-            "Table detection error:",
-            str(e)
-        )
-
+        print("Table detection error:", str(e))
         return []
 
 
 def clean_table_matrix(matrix):
-
     if not matrix:
         return []
 
@@ -129,23 +512,14 @@ def clean_table_matrix(matrix):
     max_columns = 0
 
     for row in matrix:
-
         if row is None:
             row = []
 
         cleaned_row = []
 
         for value in row:
-
-            if value is None:
-                value = ""
-
-            value = str(
-                value
-            ).strip()
-
             cleaned_row.append(
-                value
+                clean_text(value)
             )
 
         max_columns = max(
@@ -153,107 +527,421 @@ def clean_table_matrix(matrix):
             len(cleaned_row)
         )
 
-        cleaned.append(
-            cleaned_row
-        )
+        cleaned.append(cleaned_row)
 
     if max_columns == 0:
         return []
 
-    # Normalize row lengths
     for row in cleaned:
-
         while len(row) < max_columns:
             row.append("")
 
-    # Remove completely empty rows
     cleaned = [
         row
         for row in cleaned
-        if any(
-            value.strip()
-            for value in row
-        )
+        if any(value.strip() for value in row)
     ]
 
-    if not cleaned:
-        return []
-
-    # Remove columns that are completely empty
-    used_columns = []
-
-    for col_index in range(
-        max_columns
-    ):
-
-        has_content = False
-
-        for row in cleaned:
-
-            if (
-                col_index < len(row)
-                and
-                row[col_index].strip()
-            ):
-                has_content = True
-                break
-
-        if has_content:
-            used_columns.append(
-                col_index
-            )
-
-    if not used_columns:
-        return []
-
-    final_matrix = []
-
-    for row in cleaned:
-
-        final_matrix.append([
-            row[col]
-            if col < len(row)
-            else ""
-            for col in used_columns
-        ])
-
-    return final_matrix
+    return cleaned
 
 
-def calculate_column_widths_from_table(
-    table_bbox,
-    column_count
-):
+def extract_table_cell_bboxes(detected_table):
+    result = []
 
-    if column_count <= 0:
-        return []
+    try:
+        rows = detected_table.rows
 
-    x0, y0, x1, y1 = table_bbox
+        for row_index, row in enumerate(rows):
+            row_result = []
 
-    total_width = max(
-        1.0,
-        x1 - x0
-    )
+            for col_index, cell in enumerate(row.cells):
+                if cell is None:
+                    row_result.append(None)
+                    continue
 
-    equal_width = (
-        total_width /
-        column_count
-    )
+                row_result.append(
+                    bbox_dict(cell)
+                )
 
-    return [
-        equal_width
-        for _ in range(
-            column_count
-        )
-    ]
+            result.append(row_result)
+
+    except Exception:
+        pass
+
+    return result
 
 
 # ============================================================
-# PDF EXTRACTION
+# TEXT DICTIONARY EXTRACTION
+# ============================================================
+
+def extract_raw_text_blocks(page):
+    try:
+        text_dict = page.get_text(
+            "dict",
+            flags=fitz.TEXT_PRESERVE_WHITESPACE
+        )
+    except Exception:
+        text_dict = page.get_text("dict")
+
+    blocks_out = []
+
+    for raw_block in text_dict.get("blocks", []):
+        if raw_block.get("type") != 0:
+            continue
+
+        block_bbox = raw_block.get(
+            "bbox",
+            (0, 0, 0, 0)
+        )
+
+        lines_out = []
+        all_spans = []
+        text_lines = []
+
+        for raw_line in raw_block.get("lines", []):
+            line_spans = []
+
+            for raw_span in raw_line.get("spans", []):
+                normalized = normalize_span(
+                    raw_span
+                )
+
+                if not normalized["text"]:
+                    continue
+
+                line_spans.append(
+                    normalized
+                )
+
+                all_spans.append(
+                    normalized
+                )
+
+            if not line_spans:
+                continue
+
+            line_text = "".join(
+                span["text"]
+                for span in line_spans
+            ).strip()
+
+            if not line_text:
+                continue
+
+            line_bbox = raw_line.get(
+                "bbox",
+                block_bbox
+            )
+
+            lines_out.append({
+                "text": line_text,
+                "bbox": bbox_dict(line_bbox),
+                "spans": line_spans
+            })
+
+            text_lines.append(
+                line_text
+            )
+
+        text = "\n".join(
+            text_lines
+        ).strip()
+
+        if not text:
+            continue
+
+        blocks_out.append({
+            "text": text,
+            "bbox": bbox_dict(block_bbox),
+            "lines": lines_out,
+            "spans": all_spans,
+            "style": get_block_style(all_spans)
+        })
+
+    return blocks_out
+
+
+# ============================================================
+# PAGE FONT STATISTICS
+# ============================================================
+
+def get_page_font_statistics(blocks):
+    sizes = []
+
+    for block in blocks:
+        for span in block.get("spans", []):
+            size = float(
+                span.get("size", 0)
+            )
+
+            if size > 0:
+                sizes.append(size)
+
+    if not sizes:
+        return {
+            "median_size": DEFAULT_FONT_SIZE,
+            "max_size": DEFAULT_FONT_SIZE
+        }
+
+    return {
+        "median_size": round_num(
+            statistics.median(sizes)
+        ),
+        "max_size": round_num(
+            max(sizes)
+        )
+    }
+
+
+# ============================================================
+# HEADING DETECTION
+# ============================================================
+
+def classify_text_role(block, font_stats):
+    text = clean_text(
+        block.get("text", "")
+    )
+
+    style = block.get(
+        "style",
+        {}
+    )
+
+    median_size = max(
+        1,
+        float(
+            font_stats.get(
+                "median_size",
+                DEFAULT_FONT_SIZE
+            )
+        )
+    )
+
+    max_size = float(
+        style.get(
+            "max_size",
+            0
+        )
+    )
+
+    bold = bool(
+        style.get(
+            "bold",
+            False
+        )
+    )
+
+    line_count = max(
+        1,
+        len(
+            block.get(
+                "lines",
+                []
+            )
+        )
+    )
+
+    short_text = len(text) <= 120
+
+    if (
+        short_text
+        and
+        max_size >= median_size * HEADING_LARGE_RATIO
+    ):
+        return "heading_1"
+
+    if (
+        short_text
+        and
+        bold
+        and
+        max_size >= median_size * HEADING_SIZE_RATIO
+    ):
+        return "heading_2"
+
+    if (
+        short_text
+        and
+        bold
+        and
+        line_count <= 2
+    ):
+        return "subheading"
+
+    return "paragraph"
+
+
+# ============================================================
+# COLUMN DETECTION
+# ============================================================
+
+def detect_columns(blocks, page_width):
+    if not ENABLE_COLUMN_DETECTION:
+        return {
+            "column_count": 1,
+            "divider_x": None
+        }
+
+    candidates = []
+
+    for block in blocks:
+        bbox = block.get(
+            "bbox",
+            {}
+        )
+
+        x0 = float(
+            bbox.get(
+                "x0",
+                0
+            )
+        )
+
+        x1 = float(
+            bbox.get(
+                "x1",
+                0
+            )
+        )
+
+        width = x1 - x0
+
+        if (
+            width > 10
+            and
+            width < page_width * 0.70
+        ):
+            candidates.append(
+                (x0, x1)
+            )
+
+    if len(candidates) < COLUMN_MIN_BLOCKS * 2:
+        return {
+            "column_count": 1,
+            "divider_x": None
+        }
+
+    page_center = page_width / 2
+
+    left = [
+        item
+        for item in candidates
+        if item[0] < page_center
+    ]
+
+    right = [
+        item
+        for item in candidates
+        if item[0] >= page_center * 0.85
+    ]
+
+    if (
+        len(left) < COLUMN_MIN_BLOCKS
+        or
+        len(right) < COLUMN_MIN_BLOCKS
+    ):
+        return {
+            "column_count": 1,
+            "divider_x": None
+        }
+
+    left_right_edge = statistics.median(
+        item[1]
+        for item in left
+    )
+
+    right_left_edge = statistics.median(
+        item[0]
+        for item in right
+    )
+
+    gap = (
+        right_left_edge -
+        left_right_edge
+    )
+
+    if gap >= page_width * COLUMN_GAP_RATIO:
+        return {
+            "column_count": 2,
+            "divider_x": round_num(
+                (
+                    left_right_edge +
+                    right_left_edge
+                ) / 2
+            )
+        }
+
+    return {
+        "column_count": 1,
+        "divider_x": None
+    }
+
+
+# ============================================================
+# UNDERLINE DETECTION
+# ============================================================
+
+def detect_span_underlines(spans, horizontal_lines):
+    for span in spans:
+        span["underline"] = False
+
+        bbox = span.get(
+            "bbox",
+            {}
+        )
+
+        x0 = float(bbox.get("x0", 0))
+        y1 = float(bbox.get("y1", 0))
+        x1 = float(bbox.get("x1", 0))
+
+        text_width = max(
+            1,
+            x1 - x0
+        )
+
+        for line in horizontal_lines:
+            ly = float(line.get("y0", 0))
+
+            lx0 = min(
+                float(line.get("x0", 0)),
+                float(line.get("x1", 0))
+            )
+
+            lx1 = max(
+                float(line.get("x0", 0)),
+                float(line.get("x1", 0))
+            )
+
+            vertical_distance = abs(
+                ly - y1
+            )
+
+            overlap = max(
+                0,
+                min(x1, lx1) -
+                max(x0, lx0)
+            )
+
+            overlap_ratio = (
+                overlap /
+                text_width
+            )
+
+            if (
+                vertical_distance <= 3.0
+                and
+                overlap_ratio >= 0.50
+            ):
+                span["underline"] = True
+                break
+
+
+# ============================================================
+# MAIN PDF STRUCTURE EXTRACTION
 # ============================================================
 
 def extract_pdf_structure(document):
-
     pages = []
     elements = []
 
@@ -263,10 +951,13 @@ def extract_pdf_structure(document):
     for page_index in range(
         len(document)
     ):
-
         page = document[
             page_index
         ]
+
+        page_number = (
+            page_index + 1
+        )
 
         page_width = float(
             page.rect.width
@@ -276,23 +967,85 @@ def extract_pdf_structure(document):
             page.rect.height
         )
 
-        page_elements = []
-
         # ====================================================
-        # DETECT TABLES
+        # DRAWINGS
         # ====================================================
 
-        detected_tables = (
-            find_page_tables(
-                page
+        (
+            drawings,
+            lines,
+            rectangles
+        ) = normalize_drawings(
+            page
+        )
+
+        horizontal_lines = [
+            line
+            for line in lines
+            if line.get(
+                "orientation"
+            ) == "horizontal"
+        ]
+
+        vertical_lines = [
+            line
+            for line in lines
+            if line.get(
+                "orientation"
+            ) == "vertical"
+        ]
+
+        form_lines = detect_form_lines(
+            horizontal_lines,
+            page_width
+        )
+
+        # ====================================================
+        # TEXT
+        # ====================================================
+
+        raw_blocks = extract_raw_text_blocks(
+            page
+        )
+
+        for block in raw_blocks:
+            detect_span_underlines(
+                block.get(
+                    "spans",
+                    []
+                ),
+                horizontal_lines
             )
+
+            for line_data in block.get(
+                "lines",
+                []
+            ):
+                detect_span_underlines(
+                    line_data.get(
+                        "spans",
+                        []
+                    ),
+                    horizontal_lines
+                )
+
+        font_stats = get_page_font_statistics(
+            raw_blocks
+        )
+
+        # ====================================================
+        # TABLES
+        # ====================================================
+
+        detected_tables = find_page_tables(
+            page
         )
 
         table_regions = []
         table_structures = []
+        table_cell_elements = []
 
         for detected_table in detected_tables:
-
             try:
                 bbox = detected_table.bbox
 
@@ -307,27 +1060,21 @@ def extract_pdf_structure(document):
                     detected_table.extract()
                 )
 
-                matrix = (
-                    clean_table_matrix(
-                        raw_matrix
-                    )
+                matrix = clean_table_matrix(
+                    raw_matrix
                 )
 
             except Exception as e:
-
                 print(
-                    "Could not read table:",
+                    "Could not parse table:",
                     str(e)
                 )
-
                 continue
 
             if not matrix:
                 continue
 
-            row_count = len(
-                matrix
-            )
+            row_count = len(matrix)
 
             column_count = max(
                 len(row)
@@ -335,9 +1082,9 @@ def extract_pdf_structure(document):
             )
 
             if (
-                row_count <= 0
+                row_count == 0
                 or
-                column_count <= 0
+                column_count == 0
             ):
                 continue
 
@@ -347,162 +1094,108 @@ def extract_pdf_structure(document):
 
             table_counter += 1
 
-            column_widths = (
-                calculate_column_widths_from_table(
-                    table_bbox,
-                    column_count
+            cell_bboxes = (
+                extract_table_cell_bboxes(
+                    detected_table
                 )
             )
 
             table_data = {
-                "table_id":
-                    table_id,
-
-                "page":
-                    page_index + 1,
-
-                "type":
-                    "table",
-
-                "bbox": {
-                    "x0":
-                        round(
-                            table_bbox[0],
-                            2
-                        ),
-
-                    "y0":
-                        round(
-                            table_bbox[1],
-                            2
-                        ),
-
-                    "x1":
-                        round(
-                            table_bbox[2],
-                            2
-                        ),
-
-                    "y1":
-                        round(
-                            table_bbox[3],
-                            2
-                        )
-                },
-
-                "row_count":
-                    row_count,
-
-                "column_count":
-                    column_count,
-
-                "column_widths":
-                    column_widths,
-
-                "rows":
-                    []
+                "table_id": table_id,
+                "type": "table",
+                "page": page_number,
+                "bbox": bbox_dict(
+                    table_bbox
+                ),
+                "row_count": row_count,
+                "column_count": column_count,
+                "rows": []
             }
 
-            for row_index, row in enumerate(
-                matrix
+            for row_index in range(
+                row_count
             ):
-
                 row_data = []
 
                 for col_index in range(
                     column_count
                 ):
+                    value = ""
 
-                    text = ""
+                    if (
+                        row_index < len(matrix)
+                        and
+                        col_index < len(
+                            matrix[row_index]
+                        )
+                    ):
+                        value = clean_text(
+                            matrix[
+                                row_index
+                            ][
+                                col_index
+                            ]
+                        )
 
-                    if col_index < len(row):
-                        text = (
-                            row[col_index]
-                            or ""
-                        ).strip()
+                    cell_bbox = None
 
-                    if not text:
+                    if (
+                        row_index < len(
+                            cell_bboxes
+                        )
+                        and
+                        col_index < len(
+                            cell_bboxes[row_index]
+                        )
+                    ):
+                        cell_bbox = (
+                            cell_bboxes[
+                                row_index
+                            ][
+                                col_index
+                            ]
+                        )
 
-                        row_data.append({
-                            "id": None,
-                            "text": "",
+                    if not cell_bbox:
+                        cell_bbox = bbox_dict(
+                            table_bbox
+                        )
+
+                    if value:
+                        element_id = (
+                            f"pdf_{element_counter}"
+                        )
+
+                        element_counter += 1
+
+                        element = {
+                            "id": element_id,
+                            "page": page_number,
+                            "type": "table_cell",
+                            "table_id": table_id,
                             "row": row_index,
-                            "col": col_index
-                        })
-
-                        continue
-
-                    element_id = (
-                        f"pdf_{element_counter}"
-                    )
-
-                    element_counter += 1
-
-                    element = {
-                        "id":
-                            element_id,
-
-                        "page":
-                            page_index + 1,
-
-                        "type":
-                            "table_cell",
-
-                        "table_id":
-                            table_id,
-
-                        "row":
-                            row_index,
-
-                        "col":
-                            col_index,
-
-                        "text":
-                            text,
-
-                        "bbox": {
-                            "x0":
-                                round(
-                                    table_bbox[0],
-                                    2
-                                ),
-
-                            "y0":
-                                round(
-                                    table_bbox[1],
-                                    2
-                                ),
-
-                            "x1":
-                                round(
-                                    table_bbox[2],
-                                    2
-                                ),
-
-                            "y1":
-                                round(
-                                    table_bbox[3],
-                                    2
-                                )
+                            "col": col_index,
+                            "text": value,
+                            "bbox": cell_bbox
                         }
-                    }
 
-                    elements.append(
-                        element
-                    )
+                        elements.append(
+                            element
+                        )
+
+                        table_cell_elements.append(
+                            element
+                        )
+
+                    else:
+                        element_id = None
 
                     row_data.append({
-                        "id":
-                            element_id,
-
-                        "text":
-                            text,
-
-                        "row":
-                            row_index,
-
-                        "col":
-                            col_index
+                        "id": element_id,
+                        "row": row_index,
+                        "col": col_index,
+                        "text": value,
+                        "bbox": cell_bbox
                     })
 
                 table_data[
@@ -520,54 +1213,28 @@ def extract_pdf_structure(document):
             )
 
         # ====================================================
-        # NORMAL TEXT BLOCKS
+        # NON-TABLE TEXT
         # ====================================================
 
-        blocks = page.get_text(
-            "blocks"
-        )
+        text_elements = []
+        detected_lists = []
 
-        normal_blocks = []
-
-        for block in blocks:
-
-            if len(block) < 5:
-                continue
-
-            x0 = float(
-                block[0]
+        for block in raw_blocks:
+            bbox = block.get(
+                "bbox",
+                {}
             )
-
-            y0 = float(
-                block[1]
-            )
-
-            x1 = float(
-                block[2]
-            )
-
-            y1 = float(
-                block[3]
-            )
-
-            text = str(
-                block[4]
-            ).strip()
-
-            if not text:
-                continue
 
             block_rect = (
-                x0,
-                y0,
-                x1,
-                y1
+                float(bbox.get("x0", 0)),
+                float(bbox.get("y0", 0)),
+                float(bbox.get("x1", 0)),
+                float(bbox.get("y1", 0))
             )
 
             inside_table = False
 
             for table_rect in table_regions:
-
                 if rect_center_inside(
                     block_rect,
                     table_rect
@@ -578,112 +1245,15 @@ def extract_pdf_structure(document):
             if inside_table:
                 continue
 
-            normal_blocks.append({
-                "bbox":
-                    block_rect,
-
-                "text":
-                    text
-            })
-
-        # ====================================================
-        # BUILD PAGE ORDER
-        # ====================================================
-
-        ordered_items = []
-
-        for block in normal_blocks:
-
-            ordered_items.append({
-                "kind":
+            text = clean_text(
+                block.get(
                     "text",
-
-                "y0":
-                    block["bbox"][1],
-
-                "x0":
-                    block["bbox"][0],
-
-                "data":
-                    block
-            })
-
-        for table_data in table_structures:
-
-            ordered_items.append({
-                "kind":
-                    "table",
-
-                "y0":
-                    table_data[
-                        "bbox"
-                    ][
-                        "y0"
-                    ],
-
-                "x0":
-                    table_data[
-                        "bbox"
-                    ][
-                        "x0"
-                    ],
-
-                "data":
-                    table_data
-            })
-
-        ordered_items.sort(
-            key=lambda item: (
-                item["y0"],
-                item["x0"]
-            )
-        )
-
-        page_layout = []
-
-        # ====================================================
-        # CREATE NORMAL TEXT ELEMENT IDS
-        # ====================================================
-
-        for ordered_item in ordered_items:
-
-            if (
-                ordered_item[
-                    "kind"
-                ]
-                ==
-                "table"
-            ):
-
-                table_data = (
-                    ordered_item[
-                        "data"
-                    ]
+                    ""
                 )
+            )
 
-                page_layout.append({
-                    "type":
-                        "table",
-
-                    "table_id":
-                        table_data[
-                            "table_id"
-                        ]
-                })
-
+            if not text:
                 continue
-
-            block = (
-                ordered_item[
-                    "data"
-                ]
-            )
-
-            x0, y0, x1, y1 = (
-                block[
-                    "bbox"
-                ]
-            )
 
             element_id = (
                 f"pdf_{element_counter}"
@@ -691,137 +1261,248 @@ def extract_pdf_structure(document):
 
             element_counter += 1
 
+            text_role = classify_text_role(
+                block,
+                font_stats
+            )
+
+            list_info = detect_list_info(
+                text
+            )
+
+            element_type = "text_block"
+
+            if list_info:
+                element_type = "list_item"
+
             element = {
-                "id":
-                    element_id,
-
-                "page":
-                    page_index + 1,
-
-                "type":
-                    "text_block",
-
-                "text":
-                    block[
-                        "text"
-                    ],
-
-                "bbox": {
-                    "x0":
-                        round(
-                            x0,
-                            2
-                        ),
-
-                    "y0":
-                        round(
-                            y0,
-                            2
-                        ),
-
-                    "x1":
-                        round(
-                            x1,
-                            2
-                        ),
-
-                    "y1":
-                        round(
-                            y1,
-                            2
-                        )
-                }
+                "id": element_id,
+                "page": page_number,
+                "type": element_type,
+                "text": text,
+                "bbox": block["bbox"],
+                "role": text_role,
+                "style": block.get(
+                    "style",
+                    {}
+                ),
+                "lines": block.get(
+                    "lines",
+                    []
+                ),
+                "spans": block.get(
+                    "spans",
+                    []
+                ),
+                "list": list_info
             }
 
             elements.append(
                 element
             )
 
-            page_elements.append(
+            text_elements.append(
                 element
             )
 
-            page_layout.append({
-                "type":
-                    "text_block",
+            if list_info:
+                detected_lists.append({
+                    "id": element_id,
+                    "bbox": block[
+                        "bbox"
+                    ],
+                    "list_type": list_info[
+                        "list_type"
+                    ],
+                    "marker": list_info[
+                        "marker"
+                    ],
+                    "text": text
+                })
 
-                "id":
-                    element_id
+        # ====================================================
+        # COLUMN DETECTION
+        # ====================================================
+
+        columns = detect_columns(
+            raw_blocks,
+            page_width
+        )
+
+        # ====================================================
+        # PAGE LAYOUT ORDER
+        # ====================================================
+
+        layout_items = []
+
+        for element in text_elements:
+            layout_items.append({
+                "type": element[
+                    "type"
+                ],
+                "id": element[
+                    "id"
+                ],
+                "x0": element[
+                    "bbox"
+                ][
+                    "x0"
+                ],
+                "y0": element[
+                    "bbox"
+                ][
+                    "y0"
+                ]
             })
 
-        # Table cell elements also belong to page_elements
-        for table_data in table_structures:
+        for table in table_structures:
+            layout_items.append({
+                "type": "table",
+                "table_id": table[
+                    "table_id"
+                ],
+                "x0": table[
+                    "bbox"
+                ][
+                    "x0"
+                ],
+                "y0": table[
+                    "bbox"
+                ][
+                    "y0"
+                ]
+            })
 
-            for row in table_data[
-                "rows"
-            ]:
-
-                for cell in row:
-
-                    cell_id = cell.get(
-                        "id"
+        layout_items.sort(
+            key=lambda item: (
+                float(
+                    item.get(
+                        "y0",
+                        0
                     )
+                ),
+                float(
+                    item.get(
+                        "x0",
+                        0
+                    )
+                )
+            )
+        )
 
-                    if not cell_id:
-                        continue
-
-                    for element in elements:
-
-                        if (
-                            element[
-                                "id"
-                            ]
-                            ==
-                            cell_id
-                        ):
-                            page_elements.append(
-                                element
-                            )
-                            break
+        # ====================================================
+        # PAGE RESPONSE
+        # ====================================================
 
         pages.append({
-            "page":
-                page_index + 1,
+            "page": page_number,
+            "width": round_num(
+                page_width
+            ),
+            "height": round_num(
+                page_height
+            ),
 
-            "width":
-                round(
-                    page_width,
-                    2
-                ),
+            "font_statistics": font_stats,
 
-            "height":
-                round(
-                    page_height,
-                    2
-                ),
+            "column_count": columns[
+                "column_count"
+            ],
 
-            "element_count":
-                len(
-                    page_elements
-                ),
+            "column_divider_x": columns[
+                "divider_x"
+            ],
 
-            "elements":
-                page_elements,
+            "text_block_count": len(
+                text_elements
+            ),
 
-            "tables":
-                table_structures,
+            "table_count": len(
+                table_structures
+            ),
 
-            "layout":
-                page_layout
+            "list_count": len(
+                detected_lists
+            ),
+
+            "drawing_count": len(
+                drawings
+            ),
+
+            "line_count": len(
+                lines
+            ),
+
+            "horizontal_line_count": len(
+                horizontal_lines
+            ),
+
+            "vertical_line_count": len(
+                vertical_lines
+            ),
+
+            "rectangle_count": len(
+                rectangles
+            ),
+
+            "form_line_count": len(
+                form_lines
+            ),
+
+            "tables": table_structures,
+            "lists": detected_lists,
+            "drawings": drawings,
+            "lines": lines,
+            "rectangles": rectangles,
+            "form_lines": form_lines,
+            "layout": layout_items
         })
 
-    # Global elements must be in deterministic ID order
+    # ========================================================
+    # TRANSLATION CHUNKS
+    # ========================================================
+
     elements.sort(
         key=lambda item: int(
             item[
                 "id"
-            ].split(
-                "_"
-            )[1]
+            ].split("_")[1]
         )
     )
 
-    return pages, elements
+    translation_elements = []
+
+    for element in elements:
+        translation_elements.append({
+            "id": element[
+                "id"
+            ],
+            "type": element[
+                "type"
+            ],
+            "text": element[
+                "text"
+            ]
+        })
+
+    chunks = [
+        translation_elements[
+            i:i + CHUNK_SIZE
+        ]
+        for i in range(
+            0,
+            len(
+                translation_elements
+            ),
+            CHUNK_SIZE
+        )
+    ]
+
+    return (
+        pages,
+        elements,
+        chunks
+    )
 
 
 # ============================================================
@@ -829,7 +1510,6 @@ def extract_pdf_structure(document):
 # ============================================================
 
 def parse_translations(raw_value):
-
     if raw_value is None:
         return {}
 
@@ -859,7 +1539,6 @@ def parse_translations(raw_value):
     result = {}
 
     for item in translations:
-
         element_id = item.get(
             "id"
         )
@@ -890,7 +1569,6 @@ def configure_section(
     page_width,
     page_height
 ):
-
     section.page_width = Pt(
         page_width
     )
@@ -899,29 +1577,12 @@ def configure_section(
         page_height
     )
 
-    section.top_margin = Pt(
-        0
-    )
-
-    section.bottom_margin = Pt(
-        0
-    )
-
-    section.left_margin = Pt(
-        0
-    )
-
-    section.right_margin = Pt(
-        0
-    )
-
-    section.header_distance = Pt(
-        0
-    )
-
-    section.footer_distance = Pt(
-        0
-    )
+    section.top_margin = Pt(0)
+    section.bottom_margin = Pt(0)
+    section.left_margin = Pt(0)
+    section.right_margin = Pt(0)
+    section.header_distance = Pt(0)
+    section.footer_distance = Pt(0)
 
 
 def set_cell_margins(
@@ -931,23 +1592,20 @@ def set_cell_margins(
     bottom=40,
     end=60
 ):
-
     tc = cell._tc
+    tc_pr = tc.get_or_add_tcPr()
 
-    tcPr = tc.get_or_add_tcPr()
-
-    tcMar = tcPr.first_child_found_in(
+    tc_mar = tc_pr.first_child_found_in(
         "w:tcMar"
     )
 
-    if tcMar is None:
-
-        tcMar = OxmlElement(
+    if tc_mar is None:
+        tc_mar = OxmlElement(
             "w:tcMar"
         )
 
-        tcPr.append(
-            tcMar
+        tc_pr.append(
+            tc_mar
         )
 
     for margin_name, margin_value in [
@@ -956,26 +1614,26 @@ def set_cell_margins(
         ("bottom", bottom),
         ("end", end)
     ]:
-
-        node = tcMar.find(
+        node = tc_mar.find(
             qn(
                 f"w:{margin_name}"
             )
         )
 
         if node is None:
-
             node = OxmlElement(
                 f"w:{margin_name}"
             )
 
-            tcMar.append(
+            tc_mar.append(
                 node
             )
 
         node.set(
             qn("w:w"),
-            str(margin_value)
+            str(
+                margin_value
+            )
         )
 
         node.set(
@@ -985,27 +1643,27 @@ def set_cell_margins(
 
 
 def prevent_row_split(row):
-
     try:
-        trPr = (
+        tr_pr = (
             row._tr.get_or_add_trPr()
         )
 
-        cantSplit = trPr.find(
-            qn("w:cantSplit")
+        cant_split = tr_pr.find(
+            qn(
+                "w:cantSplit"
+            )
         )
 
-        if cantSplit is None:
-
-            cantSplit = OxmlElement(
+        if cant_split is None:
+            cant_split = OxmlElement(
                 "w:cantSplit"
             )
 
-            trPr.append(
-                cantSplit
+            tr_pr.append(
+                cant_split
             )
 
-        cantSplit.set(
+        cant_split.set(
             qn("w:val"),
             "1"
         )
@@ -1015,22 +1673,21 @@ def prevent_row_split(row):
 
 
 def set_table_borders(table):
-
     try:
-        tbl = table._tbl
-        tblPr = tbl.tblPr
+        tbl_pr = table._tbl.tblPr
 
-        borders = tblPr.first_child_found_in(
-            "w:tblBorders"
+        borders = (
+            tbl_pr.first_child_found_in(
+                "w:tblBorders"
+            )
         )
 
         if borders is None:
-
             borders = OxmlElement(
                 "w:tblBorders"
             )
 
-            tblPr.append(
+            tbl_pr.append(
                 borders
             )
 
@@ -1042,41 +1699,37 @@ def set_table_borders(table):
             "insideH",
             "insideV"
         ]:
+            tag = f"w:{edge}"
 
-            tag = (
-                f"w:{edge}"
-            )
-
-            element = borders.find(
+            border = borders.find(
                 qn(tag)
             )
 
-            if element is None:
-
-                element = OxmlElement(
+            if border is None:
+                border = OxmlElement(
                     tag
                 )
 
                 borders.append(
-                    element
+                    border
                 )
 
-            element.set(
+            border.set(
                 qn("w:val"),
                 "single"
             )
 
-            element.set(
+            border.set(
                 qn("w:sz"),
                 "4"
             )
 
-            element.set(
+            border.set(
                 qn("w:space"),
                 "0"
             )
 
-            element.set(
+            border.set(
                 qn("w:color"),
                 "808080"
             )
@@ -1086,43 +1739,38 @@ def set_table_borders(table):
 
 
 # ============================================================
-# ADD NORMAL TEXT
+# BASIC WORD OUTPUT
+#
+# NOTE:
+# Bu bölüm henüz yeni form/style bilgilerinin tamamını
+# kullanmıyor. Önce extraction tarafını doğruluyoruz.
 # ============================================================
 
-def add_text_block(
+def add_basic_text_block(
     document,
     element,
     translated_text,
     page_width,
     previous_bottom
 ):
-
     bbox = element[
         "bbox"
     ]
 
     x0 = float(
-        bbox[
-            "x0"
-        ]
+        bbox["x0"]
     )
 
     y0 = float(
-        bbox[
-            "y0"
-        ]
+        bbox["y0"]
     )
 
     x1 = float(
-        bbox[
-            "x1"
-        ]
+        bbox["x1"]
     )
 
     y1 = float(
-        bbox[
-            "y1"
-        ]
+        bbox["y1"]
     )
 
     paragraph = (
@@ -1136,21 +1784,16 @@ def add_text_block(
         )
     )
 
-    right_indent = max(
-        0,
-        page_width - x1
-    )
-
     paragraph.paragraph_format.right_indent = Pt(
-        right_indent
+        max(
+            0,
+            page_width - x1
+        )
     )
 
     if previous_bottom is None:
-
         vertical_gap = y0
-
     else:
-
         vertical_gap = (
             y0 -
             previous_bottom
@@ -1180,106 +1823,74 @@ def add_text_block(
         translated_text
     )
 
+    style = element.get(
+        "style",
+        {}
+    )
+
     run.font.name = (
+        style.get(
+            "font"
+        )
+        or
         DEFAULT_FONT_NAME
     )
 
-    run.font.size = Pt(
+    font_size = float(
+        style.get(
+            "size",
+            0
+        )
+        or
         DEFAULT_FONT_SIZE
+    )
+
+    run.font.size = Pt(
+        font_size
+    )
+
+    run.bold = bool(
+        style.get(
+            "bold",
+            False
+        )
+    )
+
+    run.italic = bool(
+        style.get(
+            "italic",
+            False
+        )
     )
 
     return y1
 
 
-# ============================================================
-# ADD WORD TABLE
-# ============================================================
-
-def add_word_table(
+def add_basic_table(
     document,
     table_data,
-    translations,
-    page_width,
-    previous_bottom
+    translations
 ):
-
-    row_count = int(
-        table_data[
-            "row_count"
-        ]
-    )
-
-    column_count = int(
-        table_data[
-            "column_count"
-        ]
-    )
-
-    if (
-        row_count <= 0
-        or
-        column_count <= 0
-    ):
-        return previous_bottom
-
-    bbox = (
-        table_data[
-            "bbox"
-        ]
-    )
-
-    x0 = float(
-        bbox["x0"]
-    )
-
-    y0 = float(
-        bbox["y0"]
-    )
-
-    x1 = float(
-        bbox["x1"]
-    )
-
-    y1 = float(
-        bbox["y1"]
-    )
-
-    # Vertical gap before table
-    if previous_bottom is None:
-
-        vertical_gap = y0
-
-    else:
-
-        vertical_gap = (
-            y0 -
-            previous_bottom
+    rows = int(
+        table_data.get(
+            "row_count",
+            0
         )
-
-    vertical_gap = clamp(
-        vertical_gap,
-        MIN_VERTICAL_GAP_PT,
-        MAX_VERTICAL_GAP_PT
     )
 
-    # Spacer paragraph before table
-    spacer = (
-        document.add_paragraph()
+    cols = int(
+        table_data.get(
+            "column_count",
+            0
+        )
     )
 
-    spacer.paragraph_format.space_before = Pt(
-        vertical_gap
-    )
-
-    spacer.paragraph_format.space_after = Pt(
-        0
-    )
-
-    spacer.paragraph_format.line_spacing = 1
+    if rows <= 0 or cols <= 0:
+        return
 
     table = document.add_table(
-        rows=row_count,
-        cols=column_count
+        rows=rows,
+        cols=cols
     )
 
     table.alignment = (
@@ -1292,125 +1903,28 @@ def add_word_table(
         table
     )
 
-    # Approximate table indentation
-    try:
-
-        tblPr = (
-            table._tbl.tblPr
-        )
-
-        tblInd = tblPr.find(
-            qn("w:tblInd")
-        )
-
-        if tblInd is None:
-
-            tblInd = OxmlElement(
-                "w:tblInd"
-            )
-
-            tblPr.append(
-                tblInd
-            )
-
-        # PDF points -> twips
-        indent_twips = int(
-            max(
-                0,
-                x0
-            )
-            *
-            20
-        )
-
-        tblInd.set(
-            qn("w:w"),
-            str(
-                indent_twips
-            )
-        )
-
-        tblInd.set(
-            qn("w:type"),
-            "dxa"
-        )
-
-    except Exception:
-        pass
-
-    total_pdf_width = max(
-        1.0,
-        x1 - x0
-    )
-
-    available_page_width = max(
-        1.0,
-        page_width - x0
-    )
-
-    word_table_width = min(
-        total_pdf_width,
-        available_page_width
-    )
-
-    column_widths = (
-        table_data.get(
-            "column_widths"
-        )
-        or []
-    )
-
-    if len(
-        column_widths
-    ) != column_count:
-
-        column_widths = [
-            total_pdf_width /
-            column_count
-            for _ in range(
-                column_count
-            )
-        ]
-
-    width_sum = sum(
-        column_widths
-    )
-
-    if width_sum <= 0:
-
-        width_sum = (
-            total_pdf_width
-        )
-
-    rows_data = (
-        table_data[
-            "rows"
-        ]
+    row_data = table_data.get(
+        "rows",
+        []
     )
 
     for row_index in range(
-        row_count
+        rows
     ):
-
-        word_row = (
-            table.rows[
-                row_index
-            ]
-        )
+        word_row = table.rows[
+            row_index
+        ]
 
         prevent_row_split(
             word_row
         )
 
         for col_index in range(
-            column_count
+            cols
         ):
-
-            cell = (
-                word_row.cells[
-                    col_index
-                ]
-            )
+            cell = word_row.cells[
+                col_index
+            ]
 
             cell.vertical_alignment = (
                 WD_CELL_VERTICAL_ALIGNMENT.CENTER
@@ -1420,81 +1934,49 @@ def add_word_table(
                 cell
             )
 
-            proportional_width = (
-                column_widths[
-                    col_index
-                ]
-                /
-                width_sum
-            )
+            info = None
 
-            cell_width = (
-                word_table_width
-                *
-                proportional_width
-            )
-
-            cell.width = Pt(
-                max(
-                    10,
-                    cell_width
+            if (
+                row_index < len(
+                    row_data
                 )
-            )
-
-            cell_info = None
-
-            if row_index < len(
-                rows_data
-            ):
-
-                row_data = (
-                    rows_data[
+                and
+                col_index < len(
+                    row_data[
                         row_index
                     ]
                 )
+            ):
+                info = row_data[
+                    row_index
+                ][
+                    col_index
+                ]
 
-                if col_index < len(
-                    row_data
-                ):
-
-                    cell_info = (
-                        row_data[
-                            col_index
-                        ]
-                    )
-
-            if cell_info is None:
+            if not info:
                 continue
 
-            element_id = (
-                cell_info.get(
-                    "id"
-                )
+            element_id = info.get(
+                "id"
             )
 
-            original_text = (
-                cell_info.get(
-                    "text"
-                )
-                or ""
+            original = info.get(
+                "text",
+                ""
             )
 
-            if element_id:
-
-                final_text = (
-                    translations.get(
-                        element_id,
-                        original_text
-                    )
+            translated = (
+                translations.get(
+                    element_id,
+                    original
                 )
-
-            else:
-
-                final_text = ""
-
-            paragraph = (
-                cell.paragraphs[0]
+                if element_id
+                else ""
             )
+
+            paragraph = cell.paragraphs[
+                0
+            ]
 
             paragraph.paragraph_format.space_before = Pt(
                 0
@@ -1504,27 +1986,9 @@ def add_word_table(
                 0
             )
 
-            paragraph.paragraph_format.line_spacing = 1
-
-            paragraph.alignment = (
-                WD_ALIGN_PARAGRAPH.LEFT
+            run = paragraph.add_run(
+                translated
             )
-
-            if paragraph.runs:
-
-                paragraph.runs[
-                    0
-                ].text = final_text
-
-                run = paragraph.runs[
-                    0
-                ]
-
-            else:
-
-                run = paragraph.add_run(
-                    final_text
-                )
 
             run.font.name = (
                 DEFAULT_FONT_NAME
@@ -1534,92 +1998,58 @@ def add_word_table(
                 TABLE_FONT_SIZE
             )
 
-    return y1
-
-
-# ============================================================
-# CREATE WORD FROM PDF
-# ============================================================
 
 def create_word_from_pdf(
     pdf_document,
     translations
 ):
-
-    pages, elements = (
-        extract_pdf_structure(
-            pdf_document
-        )
+    (
+        pages,
+        elements,
+        chunks
+    ) = extract_pdf_structure(
+        pdf_document
     )
 
     document = Document()
 
-    # Remove visual impact of default paragraph
-    if document.paragraphs:
-
-        paragraph = (
-            document.paragraphs[0]
-        )
-
-        paragraph.text = ""
-
-        paragraph.paragraph_format.space_before = Pt(
-            0
-        )
-
-        paragraph.paragraph_format.space_after = Pt(
-            0
-        )
-
-        paragraph.paragraph_format.line_spacing = 1
-
     element_lookup = {
-        element["id"]:
-            element
+        element["id"]: element
         for element in elements
     }
+
+    if document.paragraphs:
+        p = document.paragraphs[0]
+        p.text = ""
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
 
     for page_index, page_data in enumerate(
         pages
     ):
-
-        page_width = float(
-            page_data[
-                "width"
-            ]
+        width = float(
+            page_data["width"]
         )
 
-        page_height = float(
-            page_data[
-                "height"
-            ]
+        height = float(
+            page_data["height"]
         )
 
         if page_index == 0:
-
-            section = (
-                document.sections[0]
-            )
-
+            section = document.sections[0]
         else:
-
-            section = (
-                document.add_section(
-                    WD_SECTION.NEW_PAGE
-                )
+            section = document.add_section(
+                WD_SECTION.NEW_PAGE
             )
 
         configure_section(
             section,
-            page_width,
-            page_height
+            width,
+            height
         )
 
         table_lookup = {
-            table[
-                "table_id"
-            ]:
-                table
+            table["table_id"]: table
             for table in page_data.get(
                 "tables",
                 []
@@ -1628,87 +2058,70 @@ def create_word_from_pdf(
 
         previous_bottom = None
 
-        for layout_item in page_data.get(
+        for item in page_data.get(
             "layout",
             []
         ):
+            item_type = item.get(
+                "type"
+            )
 
-            item_type = (
-                layout_item.get(
-                    "type"
+            if item_type == "table":
+                table_id = item.get(
+                    "table_id"
+                )
+
+                table_data = table_lookup.get(
+                    table_id
+                )
+
+                if table_data:
+                    add_basic_table(
+                        document,
+                        table_data,
+                        translations
+                    )
+
+                    previous_bottom = float(
+                        table_data[
+                            "bbox"
+                        ][
+                            "y1"
+                        ]
+                    )
+
+                continue
+
+            element_id = item.get(
+                "id"
+            )
+
+            element = element_lookup.get(
+                element_id
+            )
+
+            if not element:
+                continue
+
+            translated_text = (
+                translations.get(
+                    element_id,
+                    element.get(
+                        "text",
+                        ""
+                    )
                 )
             )
 
-            # ================================================
-            # NORMAL TEXT
-            # ================================================
-
-            if item_type == "text_block":
-
-                element_id = (
-                    layout_item.get(
-                        "id"
-                    )
+            previous_bottom = (
+                add_basic_text_block(
+                    document,
+                    element,
+                    translated_text,
+                    width,
+                    previous_bottom
                 )
-
-                element = (
-                    element_lookup.get(
-                        element_id
-                    )
-                )
-
-                if not element:
-                    continue
-
-                translated_text = (
-                    translations.get(
-                        element_id,
-                        element[
-                            "text"
-                        ]
-                    )
-                )
-
-                previous_bottom = (
-                    add_text_block(
-                        document,
-                        element,
-                        translated_text,
-                        page_width,
-                        previous_bottom
-                    )
-                )
-
-            # ================================================
-            # TABLE
-            # ================================================
-
-            elif item_type == "table":
-
-                table_id = (
-                    layout_item.get(
-                        "table_id"
-                    )
-                )
-
-                table_data = (
-                    table_lookup.get(
-                        table_id
-                    )
-                )
-
-                if not table_data:
-                    continue
-
-                previous_bottom = (
-                    add_word_table(
-                        document,
-                        table_data,
-                        translations,
-                        page_width,
-                        previous_bottom
-                    )
-                )
+            )
 
     output = BytesIO()
 
@@ -1716,15 +2129,13 @@ def create_word_from_pdf(
         output
     )
 
-    output.seek(
-        0
-    )
+    output.seek(0)
 
     return output
 
 
 # ============================================================
-# EXTRACT PDF
+# EXTRACT PDF ROUTE
 # ============================================================
 
 @app.route(
@@ -1732,22 +2143,17 @@ def create_word_from_pdf(
     methods=["POST"]
 )
 def extract_pdf():
-
     if "file" not in request.files:
-
         return jsonify({
             "error":
                 "No PDF file received"
         }), 400
 
     uploaded_file = (
-        request.files[
-            "file"
-        ]
+        request.files["file"]
     )
 
     try:
-
         pdf_bytes = (
             uploaded_file.read()
         )
@@ -1758,69 +2164,92 @@ def extract_pdf():
         )
 
     except Exception as e:
-
         return jsonify({
             "error":
                 "Could not read PDF file",
-
             "details":
                 str(e)
         }), 400
 
     try:
-
-        pages, elements = (
-            extract_pdf_structure(
-                document
-            )
+        (
+            pages,
+            elements,
+            chunks
+        ) = extract_pdf_structure(
+            document
         )
 
-        chunks = [
-            elements[
-                i:i + CHUNK_SIZE
-            ]
-            for i in range(
-                0,
-                len(elements),
-                CHUNK_SIZE
-            )
-        ]
-
         table_count = sum(
-            len(
-                page.get(
-                    "tables",
-                    []
-                )
+            page.get(
+                "table_count",
+                0
             )
             for page in pages
         )
 
-        return jsonify({
+        list_count = sum(
+            page.get(
+                "list_count",
+                0
+            )
+            for page in pages
+        )
 
+        line_count = sum(
+            page.get(
+                "line_count",
+                0
+            )
+            for page in pages
+        )
+
+        form_line_count = sum(
+            page.get(
+                "form_line_count",
+                0
+            )
+            for page in pages
+        )
+
+        rectangle_count = sum(
+            page.get(
+                "rectangle_count",
+                0
+            )
+            for page in pages
+        )
+
+        response = {
             "filename":
                 uploaded_file.filename,
 
             "page_count":
-                len(
-                    pages
-                ),
+                len(pages),
 
             "element_count":
-                len(
-                    elements
-                ),
-
-            "table_count":
-                table_count,
+                len(elements),
 
             "chunk_size":
                 CHUNK_SIZE,
 
             "chunk_count":
-                len(
-                    chunks
-                ),
+                len(chunks),
+
+            "table_count":
+                table_count,
+
+            "list_count":
+                list_count,
+
+            "line_count":
+                line_count,
+
+            "form_line_count":
+                form_line_count,
+
+            "rectangle_count":
+                rectangle_count,
 
             "pages":
                 pages,
@@ -1830,15 +2259,18 @@ def extract_pdf():
 
             "chunks":
                 chunks
-        })
+        }
+
+        return jsonify(
+            response
+        )
 
     finally:
-
         document.close()
 
 
 # ============================================================
-# CREATE DOCX
+# CREATE DOCX ROUTE
 # ============================================================
 
 @app.route(
@@ -1846,27 +2278,15 @@ def extract_pdf():
     methods=["POST"]
 )
 def create_docx():
-
-    # --------------------------------------------------------
-    # PDF CHECK
-    # --------------------------------------------------------
-
     if "file" not in request.files:
-
         return jsonify({
             "error":
                 "No PDF file received"
         }), 400
 
     uploaded_file = (
-        request.files[
-            "file"
-        ]
+        request.files["file"]
     )
-
-    # --------------------------------------------------------
-    # TRANSLATIONS CHECK
-    # --------------------------------------------------------
 
     translations_raw = (
         request.form.get(
@@ -1875,18 +2295,12 @@ def create_docx():
     )
 
     if not translations_raw:
-
         return jsonify({
             "error":
                 "No translations JSON received"
         }), 400
 
-    # --------------------------------------------------------
-    # PARSE TRANSLATIONS
-    # --------------------------------------------------------
-
     try:
-
         translations = (
             parse_translations(
                 translations_raw
@@ -1894,28 +2308,20 @@ def create_docx():
         )
 
     except Exception as e:
-
         return jsonify({
             "error":
                 "Could not parse translations JSON",
-
             "details":
                 str(e)
         }), 400
 
     if not translations:
-
         return jsonify({
             "error":
                 "Translations list is empty"
         }), 400
 
-    # --------------------------------------------------------
-    # OPEN ORIGINAL PDF
-    # --------------------------------------------------------
-
     try:
-
         pdf_bytes = (
             uploaded_file.read()
         )
@@ -1926,21 +2332,14 @@ def create_docx():
         )
 
     except Exception as e:
-
         return jsonify({
             "error":
                 "Could not read original PDF",
-
             "details":
                 str(e)
         }), 400
 
-    # --------------------------------------------------------
-    # CREATE WORD
-    # --------------------------------------------------------
-
     try:
-
         word_file = (
             create_word_from_pdf(
                 pdf_document,
@@ -1949,22 +2348,15 @@ def create_docx():
         )
 
     except Exception as e:
-
         return jsonify({
             "error":
                 "Could not create DOCX",
-
             "details":
                 str(e)
         }), 500
 
     finally:
-
         pdf_document.close()
-
-    # --------------------------------------------------------
-    # OUTPUT NAME
-    # --------------------------------------------------------
 
     original_name = (
         uploaded_file.filename
@@ -1975,7 +2367,6 @@ def create_docx():
     if original_name.lower().endswith(
         ".pdf"
     ):
-
         original_name = (
             original_name[:-4]
         )
@@ -1984,17 +2375,12 @@ def create_docx():
         f"{original_name}_translated.docx"
     )
 
-    # --------------------------------------------------------
-    # RETURN DOCX
-    # --------------------------------------------------------
-
     return send_file(
         word_file,
         as_attachment=True,
         download_name=output_filename,
         mimetype=(
-            "application/"
-            "vnd.openxmlformats-officedocument."
+            "application/vnd.openxmlformats-officedocument."
             "wordprocessingml.document"
         )
     )
