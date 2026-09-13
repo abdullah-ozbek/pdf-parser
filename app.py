@@ -5,6 +5,7 @@ import fitz
 import json
 import re
 import statistics
+from difflib import SequenceMatcher
 
 from io import BytesIO
 
@@ -38,6 +39,15 @@ ENABLE_LIST_DETECTION = True
 ENABLE_STYLE_DETECTION = True
 ENABLE_COLUMN_DETECTION = True
 ENABLE_FORM_DETECTION = True
+
+# Spatial duplicate suppression. PDF generators sometimes expose the same
+# visible text more than once (for example as overlapping text objects).
+# Suppress those duplicates BEFORE pdf_N IDs are assigned.
+ENABLE_SPATIAL_DUPLICATE_DETECTION = True
+SPATIAL_DUPLICATE_IOU = 0.72
+SPATIAL_DUPLICATE_CONTAINMENT = 0.86
+SPATIAL_DUPLICATE_TEXT_SIMILARITY = 0.90
+SPATIAL_DUPLICATE_CENTER_TOLERANCE_PT = 5.0
 ENABLE_FORM_DOCX_REBUILD = True
 
 HEADING_SIZE_RATIO = 1.18
@@ -155,6 +165,117 @@ def bbox_overlap_ratio(a, b):
     inter = ix * iy
     area = max(1.0, (ax1 - ax0) * (ay1 - ay0))
     return inter / area
+
+
+def _rect_metrics(a, b):
+    ax0, ay0, ax1, ay1 = map(float, a)
+    bx0, by0, bx1, by1 = map(float, b)
+    iw = max(0.0, min(ax1, bx1) - max(ax0, bx0))
+    ih = max(0.0, min(ay1, by1) - max(ay0, by0))
+    inter = iw * ih
+    area_a = max(1.0, (ax1 - ax0) * (ay1 - ay0))
+    area_b = max(1.0, (bx1 - bx0) * (by1 - by0))
+    union = max(1.0, area_a + area_b - inter)
+    return inter / union, inter / min(area_a, area_b)
+
+
+def _normalized_spatial_text(text):
+    text = clean_text(text).lower()
+    text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[^\wäöüßçğıöşü]+", "", text, flags=re.UNICODE)
+    return text
+
+
+def _block_rect(block):
+    b = block.get("bbox", {})
+    return (
+        float(b.get("x0", 0)), float(b.get("y0", 0)),
+        float(b.get("x1", 0)), float(b.get("y1", 0)),
+    )
+
+
+def _block_quality(block):
+    # Prefer the richer extraction when two objects describe the same region.
+    text = clean_text(block.get("text", ""))
+    spans = block.get("spans", []) or []
+    lines = block.get("lines", []) or []
+    return (len(text), len(spans), len(lines))
+
+
+def blocks_are_spatial_duplicates(a, b):
+    ta = _normalized_spatial_text(a.get("text", ""))
+    tb = _normalized_spatial_text(b.get("text", ""))
+    if not ta or not tb:
+        return False
+
+    ra, rb = _block_rect(a), _block_rect(b)
+    iou, containment = _rect_metrics(ra, rb)
+    acx, acy = (ra[0] + ra[2]) / 2, (ra[1] + ra[3]) / 2
+    bcx, bcy = (rb[0] + rb[2]) / 2, (rb[1] + rb[3]) / 2
+    centers_close = (
+        abs(acx - bcx) <= SPATIAL_DUPLICATE_CENTER_TOLERANCE_PT
+        and abs(acy - bcy) <= SPATIAL_DUPLICATE_CENTER_TOLERANCE_PT
+    )
+
+    # Exact normalized text needs only strong geometric evidence.
+    if ta == tb:
+        return (
+            iou >= SPATIAL_DUPLICATE_IOU
+            or containment >= SPATIAL_DUPLICATE_CONTAINMENT
+            or centers_close
+        )
+
+    # Near-identical text must also substantially occupy the same region.
+    similarity = SequenceMatcher(None, ta, tb).ratio()
+    return (
+        similarity >= SPATIAL_DUPLICATE_TEXT_SIMILARITY
+        and (
+            iou >= SPATIAL_DUPLICATE_IOU
+            or containment >= SPATIAL_DUPLICATE_CONTAINMENT
+        )
+    )
+
+
+def suppress_spatial_duplicate_blocks(blocks):
+    if not ENABLE_SPATIAL_DUPLICATE_DETECTION:
+        return blocks, []
+
+    kept = []
+    suppressed = []
+    # Stable visual order makes the result deterministic across /extract-pdf
+    # and /create-docx, which is essential because translations use pdf_N IDs.
+    ordered = sorted(
+        blocks,
+        key=lambda b: (
+            round(float(b.get("bbox", {}).get("y0", 0)), 2),
+            round(float(b.get("bbox", {}).get("x0", 0)), 2),
+            -len(clean_text(b.get("text", ""))),
+        ),
+    )
+
+    for block in ordered:
+        duplicate_index = None
+        for i, existing in enumerate(kept):
+            if blocks_are_spatial_duplicates(block, existing):
+                duplicate_index = i
+                break
+
+        if duplicate_index is None:
+            kept.append(block)
+            continue
+
+        existing = kept[duplicate_index]
+        if _block_quality(block) > _block_quality(existing):
+            kept[duplicate_index] = block
+            suppressed.append(existing)
+        else:
+            suppressed.append(block)
+
+    kept.sort(key=lambda b: (
+        float(b.get("bbox", {}).get("y0", 0)),
+        float(b.get("bbox", {}).get("x0", 0)),
+    ))
+    return kept, suppressed
 
 # ============================================================
 # FONT / STYLE
@@ -1304,6 +1425,9 @@ def extract_pdf_structure(document):
         )
 
         raw_blocks = extract_raw_text_blocks(page)
+        raw_blocks, suppressed_spatial_duplicates = suppress_spatial_duplicate_blocks(
+            raw_blocks
+        )
 
         for block in raw_blocks:
             detect_span_underlines(
@@ -1590,6 +1714,7 @@ def extract_pdf_structure(document):
             "column_count": columns["column_count"],
             "column_divider_x": columns["divider_x"],
             "text_block_count": len(text_elements),
+            "spatial_duplicate_count": len(suppressed_spatial_duplicates),
             "header_block_count": len(header_elements),
             "footer_block_count": len(footer_elements),
             "table_count": len(table_structures),
@@ -3013,6 +3138,9 @@ def extract_pdf():
             "filename": uploaded_file.filename,
             "page_count": len(pages),
             "element_count": len(elements),
+        "spatial_duplicate_count": sum(
+            page.get("spatial_duplicate_count", 0) for page in pages
+        ),
             "chunk_size": CHUNK_SIZE,
             "chunk_count": len(chunks),
             "table_count": sum(
