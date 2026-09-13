@@ -111,6 +111,12 @@ ENABLE_HEADER_DETECTION = True
 HEADER_REGION_END_RATIO = 0.36
 HEADER_REPEAT_MIN_PAGES = 2
 HEADER_POSITION_TOLERANCE_RATIO = 0.08
+# Unique first-page letterheads should be compact. Large upper-page body
+# blocks that happen to contain an URL / e-mail must never become Word
+# headers, otherwise Word repeats that body text on every overflow page.
+HEADER_UNIQUE_MAX_HEIGHT_RATIO = 0.14
+HEADER_UNIQUE_MAX_TEXT_LENGTH = 420
+HEADER_UNIQUE_MAX_LINES = 10
 HEADER_CONTACT_REGEX = re.compile(
     r"(gmbh|ag\b|kg\b|straße|strasse|telefon|tel\.?\s|telefax|fax\b|"
     r"e-?mail|@|www\.|https?://|iban|bic|bank|sparkasse|\b\d{5}\s+[A-ZÄÖÜ])",
@@ -652,6 +658,14 @@ def find_vertical_boundaries(field_line, vertical_lines):
 
 
 def find_form_label(field_line, raw_blocks):
+    """Find the nearest *text line* above a form underline.
+
+    Earlier versions used the whole PDF text block as a label. One block can
+    contain many form labels, so the same German block was then reused in
+    several reconstructed cells. Working at line granularity keeps every
+    inferred field tied to one visual label line while still translating the
+    original block only once.
+    """
     fx0 = float(field_line.get("x0", 0))
     fx1 = float(field_line.get("x1", 0))
     fy = float(field_line.get("y0", 0))
@@ -659,55 +673,80 @@ def find_form_label(field_line, raw_blocks):
     candidates = []
 
     for block in raw_blocks:
-        text = clean_text(block.get("text", ""))
-        if not text:
-            continue
+        block_lines = block.get("lines", []) or []
 
-        bbox = block.get("bbox", {})
-        bx0 = float(bbox.get("x0", 0))
-        by0 = float(bbox.get("y0", 0))
-        bx1 = float(bbox.get("x1", 0))
-        by1 = float(bbox.get("y1", 0))
+        # Fall back to the whole block only when PyMuPDF did not expose lines.
+        if not block_lines:
+            block_lines = [{
+                "text": clean_text(block.get("text", "")),
+                "bbox": block.get("bbox", {}),
+                "_line_index": 0,
+            }]
 
-        vertical_distance = fy - by1
+        for line_index, line_data in enumerate(block_lines):
+            text = clean_text(line_data.get("text", ""))
+            if not text:
+                # normalize_raw_text_blocks stores spans on lines; rebuild text
+                # defensively if a line-level text value is missing.
+                text = clean_text("".join(
+                    span.get("text", "")
+                    for span in (line_data.get("spans", []) or [])
+                ))
+            if not text:
+                continue
 
-        if (
-            vertical_distance < -FORM_LABEL_MAX_BELOW_PT
-            or vertical_distance > FORM_LABEL_MAX_ABOVE_PT
-        ):
-            continue
+            bbox = line_data.get("bbox") or block.get("bbox", {})
+            bx0 = float(bbox.get("x0", 0))
+            by0 = float(bbox.get("y0", 0))
+            bx1 = float(bbox.get("x1", 0))
+            by1 = float(bbox.get("y1", 0))
 
-        overlap = horizontal_overlap(
-            fx0 - FORM_LABEL_X_TOLERANCE,
-            fx1 + FORM_LABEL_X_TOLERANCE,
-            bx0,
-            bx1,
-        )
+            vertical_distance = fy - by1
 
-        if overlap <= 0:
-            continue
+            if (
+                vertical_distance < -FORM_LABEL_MAX_BELOW_PT
+                or vertical_distance > FORM_LABEL_MAX_ABOVE_PT
+            ):
+                continue
 
-        block_width = max(1.0, bx1 - bx0)
-        overlap_ratio = overlap / block_width
+            overlap = horizontal_overlap(
+                fx0 - FORM_LABEL_X_TOLERANCE,
+                fx1 + FORM_LABEL_X_TOLERANCE,
+                bx0,
+                bx1,
+            )
 
-        center_field = (fx0 + fx1) / 2
-        center_text = (bx0 + bx1) / 2
-        center_distance = abs(center_field - center_text)
+            if overlap <= 0:
+                continue
 
-        score = (
-            abs(vertical_distance) * 4
-            + center_distance
-            - overlap_ratio * 20
-        )
+            line_width = max(1.0, bx1 - bx0)
+            overlap_ratio = overlap / line_width
 
-        candidates.append({
-            "score": score,
-            "text": text,
-            "bbox": block["bbox"],
-        })
+            center_field = (fx0 + fx1) / 2
+            center_text = (bx0 + bx1) / 2
+            center_distance = abs(center_field - center_text)
+
+            score = (
+                abs(vertical_distance) * 4
+                + center_distance
+                - overlap_ratio * 20
+            )
+
+            candidates.append({
+                "score": score,
+                "text": text,
+                "bbox": bbox,
+                "line_index": line_index,
+                "source_block_bbox": block.get("bbox", {}),
+            })
 
     if not candidates:
-        return {"text": "", "bbox": None}
+        return {
+            "text": "",
+            "bbox": None,
+            "line_index": None,
+            "source_block_bbox": None,
+        }
 
     candidates.sort(key=lambda item: item["score"])
     best = candidates[0]
@@ -715,6 +754,8 @@ def find_form_label(field_line, raw_blocks):
     return {
         "text": best["text"],
         "bbox": best["bbox"],
+        "line_index": best["line_index"],
+        "source_block_bbox": best["source_block_bbox"],
     }
 
 
@@ -858,6 +899,8 @@ def detect_form_structure(form_lines, vertical_lines, raw_blocks):
             "line_source": line.get("source"),
             "label": label_info["text"],
             "label_bbox": label_info["bbox"],
+            "label_line_index": label_info.get("line_index"),
+            "label_source_block_bbox": label_info.get("source_block_bbox"),
             "left_border": vertical_info["left_border"],
             "right_border": vertical_info["right_border"],
             "internal_borders": vertical_info["internal_borders"],
@@ -1391,9 +1434,20 @@ def block_is_header(block, page_height, repeated_header_signatures):
         if abs(rel_y - typical_y) <= HEADER_POSITION_TOLERANCE_RATIO:
             return True
 
-    # Unique first-page letterheads are common. In the upper area, contact / company
-    # information is treated as letterhead even if it occurs only once.
-    if HEADER_CONTACT_REGEX.search(text):
+    # Unique first-page letterheads are common, but they must be compact.
+    # A large body block near the top may contain an e-mail or URL; placing
+    # such a block into a Word header makes Word repeat it on every overflow
+    # page. Guard against that by limiting block height, text size and lines.
+    y1 = float(bbox.get("y1", y0))
+    block_height_ratio = max(0.0, y1 - y0) / page_height
+    line_count = len(block.get("lines", []) or [])
+
+    if (
+        HEADER_CONTACT_REGEX.search(text)
+        and block_height_ratio <= HEADER_UNIQUE_MAX_HEIGHT_RATIO
+        and len(text) <= HEADER_UNIQUE_MAX_TEXT_LENGTH
+        and line_count <= HEADER_UNIQUE_MAX_LINES
+    ):
         return True
 
     return False
@@ -2294,10 +2348,13 @@ def element_is_used_as_form_label(
     )
 
     for label_bbox in label_bboxes:
-        if bbox_overlap_ratio(
-            rect,
-            label_bbox,
-        ) >= 0.35:
+        overlap = bbox_overlap_ratio(rect, label_bbox)
+        _, containment = _rect_metrics(rect, label_bbox)
+
+        # label_bbox is now line-sized. A label line can sit inside a much
+        # larger PDF text block, so containment is more reliable than using
+        # the whole element area as the denominator.
+        if overlap >= 0.35 or containment >= 0.82:
             return True
 
     return False
@@ -2424,14 +2481,13 @@ def add_form_heading_block(
 
 
 
-def find_best_form_label_element(field, page_elements, claimed_ids=None):
-    """Return the single text element that best represents a detected form label.
+def find_best_form_label_element(field, page_elements, claimed_label_keys=None):
+    """Return the source block and line index for one reconstructed label.
 
-    A PDF label can geometrically overlap more than one inferred field.  This
-    helper makes label ownership exclusive: once an element is claimed by one
-    field, it cannot be reused by another field on the same page/document.
+    Multiple form labels may live inside the same PDF text block. Therefore
+    ownership is tracked per (element_id, line_index), not per whole element.
     """
-    claimed_ids = claimed_ids or set()
+    claimed_label_keys = claimed_label_keys or set()
     label_bbox = field.get("label_bbox")
     if not label_bbox:
         return None
@@ -2442,13 +2498,14 @@ def find_best_form_label_element(field, page_elements, claimed_ids=None):
         float(label_bbox.get("x1", 0)),
         float(label_bbox.get("y1", 0)),
     )
+    wanted_line_index = field.get("label_line_index")
 
     best = None
-    best_score = 0.0
+    best_score = -1.0
 
     for element in page_elements:
         element_id = element.get("id")
-        if not element_id or element_id in claimed_ids:
+        if not element_id:
             continue
         if element.get("type") not in ("text_block", "list_item"):
             continue
@@ -2462,13 +2519,21 @@ def find_best_form_label_element(field, page_elements, claimed_ids=None):
         )
 
         overlap = bbox_overlap_ratio(rect, target)
-        if overlap > best_score:
-            best_score = overlap
-            best = element
+        _, containment = _rect_metrics(rect, target)
+        score = max(overlap, containment)
 
-    # Require meaningful geometric agreement.  This prevents a nearby body
-    # block from being consumed just because no exact label block was found.
-    if best_score < 0.35:
+        if score > best_score:
+            key = (str(element_id), wanted_line_index)
+            if key in claimed_label_keys:
+                continue
+            best_score = score
+            best = {
+                "element": element,
+                "line_index": wanted_line_index,
+                "claim_key": key,
+            }
+
+    if best_score < 0.55:
         return None
 
     return best
@@ -2483,6 +2548,7 @@ def add_form_row(
     page_elements,
     translations,
     rendered_ids,
+    claimed_label_keys,
 ):
     fields = [
         field_lookup[field_id]
@@ -2595,29 +2661,52 @@ def add_form_row(
         paragraph.paragraph_format.space_after = Pt(0)
         paragraph.paragraph_format.line_spacing = 1
 
-        # A detected PDF text block may geometrically match several form
-        # fields. Claim it once, translate it once, and never reuse it in a
-        # second cell. This is the main protection against repeated labels.
-        label_element = find_best_form_label_element(
+        # A single PDF block may contain several labels. Match the visual
+        # label line, then take the same line from the translated block.
+        # Claiming happens per (element_id, line_index), so one source block
+        # can safely serve multiple distinct fields without being duplicated.
+        label_match = find_best_form_label_element(
             field,
             page_elements,
-            rendered_ids,
+            claimed_label_keys,
         )
 
-        if label_element is not None:
+        label = ""
+        if label_match is not None:
+            label_element = label_match["element"]
             label_id = label_element.get("id")
-            label = clean_text(
+            line_index = label_match.get("line_index")
+
+            translated_block = clean_text(
                 translations.get(
                     label_id,
-                    label_element.get("text", field.get("label", "")),
+                    label_element.get("text", ""),
                 )
             )
+
+            translated_lines = [
+                clean_text(part)
+                for part in translated_block.splitlines()
+                if clean_text(part)
+            ]
+
+            if (
+                line_index is not None
+                and 0 <= int(line_index) < len(translated_lines)
+            ):
+                label = translated_lines[int(line_index)]
+            elif len(translated_lines) == 1:
+                label = translated_lines[0]
+
+            claimed_label_keys.add(label_match["claim_key"])
             if label_id:
+                # The whole source block is a form-label carrier and must not
+                # later be emitted again as body text.
                 rendered_ids.add(label_id)
-        else:
-            # Fallback only when extraction did not produce a matching text
-            # element. This preserves the detected form geometry.
-            label = clean_text(field.get("label", ""))
+
+        # Never fall back to the raw German field label here. If a translated
+        # line cannot be matched safely, leave the visual field blank instead
+        # of reintroducing duplicate source-language text.
 
         if label:
             run = paragraph.add_run(label)
@@ -2767,6 +2856,7 @@ def add_form_page(
     )
 
     previous_y = None
+    claimed_label_keys = set()
 
     for event in events:
         if event["kind"] == "text":
@@ -2799,6 +2889,7 @@ def add_form_page(
                 page_elements,
                 translations,
                 rendered_ids,
+                claimed_label_keys,
             )
 
 
