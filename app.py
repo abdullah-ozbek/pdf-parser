@@ -2283,12 +2283,66 @@ def add_form_heading_block(
     return y1
 
 
+
+def find_best_form_label_element(field, page_elements, claimed_ids=None):
+    """Return the single text element that best represents a detected form label.
+
+    A PDF label can geometrically overlap more than one inferred field.  This
+    helper makes label ownership exclusive: once an element is claimed by one
+    field, it cannot be reused by another field on the same page/document.
+    """
+    claimed_ids = claimed_ids or set()
+    label_bbox = field.get("label_bbox")
+    if not label_bbox:
+        return None
+
+    target = (
+        float(label_bbox.get("x0", 0)),
+        float(label_bbox.get("y0", 0)),
+        float(label_bbox.get("x1", 0)),
+        float(label_bbox.get("y1", 0)),
+    )
+
+    best = None
+    best_score = 0.0
+
+    for element in page_elements:
+        element_id = element.get("id")
+        if not element_id or element_id in claimed_ids:
+            continue
+        if element.get("type") not in ("text_block", "list_item"):
+            continue
+
+        bbox = element.get("bbox", {})
+        rect = (
+            float(bbox.get("x0", 0)),
+            float(bbox.get("y0", 0)),
+            float(bbox.get("x1", 0)),
+            float(bbox.get("y1", 0)),
+        )
+
+        overlap = bbox_overlap_ratio(rect, target)
+        if overlap > best_score:
+            best_score = overlap
+            best = element
+
+    # Require meaningful geometric agreement.  This prevents a nearby body
+    # block from being consumed just because no exact label block was found.
+    if best_score < 0.35:
+        return None
+
+    return best
+
+
 def add_form_row(
     document,
     row_data,
     field_lookup,
     page_width,
     previous_y,
+    page_elements,
+    translations,
+    rendered_ids,
 ):
     fields = [
         field_lookup[field_id]
@@ -2401,25 +2455,38 @@ def add_form_row(
         paragraph.paragraph_format.space_after = Pt(0)
         paragraph.paragraph_format.line_spacing = 1
 
-        label = clean_text(
-            field.get(
-                "label",
-                "",
-            )
+        # A detected PDF text block may geometrically match several form
+        # fields. Claim it once, translate it once, and never reuse it in a
+        # second cell. This is the main protection against repeated labels.
+        label_element = find_best_form_label_element(
+            field,
+            page_elements,
+            rendered_ids,
         )
+
+        if label_element is not None:
+            label_id = label_element.get("id")
+            label = clean_text(
+                translations.get(
+                    label_id,
+                    label_element.get("text", field.get("label", "")),
+                )
+            )
+            if label_id:
+                rendered_ids.add(label_id)
+        else:
+            # Fallback only when extraction did not produce a matching text
+            # element. This preserves the detected form geometry.
+            label = clean_text(field.get("label", ""))
 
         if label:
             run = paragraph.add_run(label)
             run.font.name = DEFAULT_FONT_NAME
-            run.font.size = Pt(
-                FORM_DOCX_FONT_PT
-            )
+            run.font.size = Pt(FORM_DOCX_FONT_PT)
         else:
             run = paragraph.add_run(" ")
             run.font.name = DEFAULT_FONT_NAME
-            run.font.size = Pt(
-                FORM_DOCX_FONT_PT
-            )
+            run.font.size = Pt(FORM_DOCX_FONT_PT)
 
         # Formun esas yazma çizgisi: alt border
         set_cell_border(
@@ -2589,6 +2656,9 @@ def add_form_page(
                 field_lookup,
                 page_width,
                 previous_y,
+                page_elements,
+                translations,
+                rendered_ids,
             )
 
 
@@ -2738,6 +2808,10 @@ def create_word_from_pdf(
         for element in elements
     }
 
+    # One render ledger for the entire DOCX.  An extracted pdf_N element may
+    # be consumed by header, footer, form, table/body logic, but never twice.
+    global_rendered_ids = set()
+
     elements_by_page = {}
 
     for element in elements:
@@ -2769,7 +2843,8 @@ def create_word_from_pdf(
             page_height,
         )
 
-        rendered_ids = set()
+        # Deliberately reuse the document-wide set. Do not reset per page.
+        rendered_ids = global_rendered_ids
 
         add_page_header(
             section,
@@ -2839,11 +2914,25 @@ def create_word_from_pdf(
                 )
 
                 if table_data:
-                    add_basic_table(
-                        document,
-                        table_data,
-                        translations,
-                    )
+                    # Skip a table only if every translated cell has already
+                    # been consumed elsewhere. Otherwise render it once and
+                    # claim all of its cell IDs globally.
+                    table_cell_ids = [
+                        cell.get("id")
+                        for row_data in table_data.get("rows", [])
+                        for cell in row_data
+                        if cell.get("id")
+                    ]
+
+                    if not table_cell_ids or not all(
+                        cell_id in rendered_ids for cell_id in table_cell_ids
+                    ):
+                        add_basic_table(
+                            document,
+                            table_data,
+                            translations,
+                        )
+                        rendered_ids.update(table_cell_ids)
 
                     previous_bottom = float(
                         table_data[
