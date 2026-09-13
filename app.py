@@ -14,7 +14,7 @@ from difflib import SequenceMatcher
 from io import BytesIO
 
 from docx import Document
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
 from docx.enum.section import WD_SECTION
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
@@ -93,6 +93,13 @@ FORM_DOCX_HEADING_FONT_PT = 9.0
 FORM_DOCX_ROW_GAP_MAX_PT = 10.0
 FORM_DOCX_LEFT_RIGHT_SAFETY_PT = 3.0
 FORM_DOCX_MIN_CELL_WIDTH_PT = 24.0
+
+# Generic form-layout preservation. PDF forms differ: some place the field
+# label below the writing line, others above it. Preserve the detected visual
+# relationship instead of imposing one fixed layout.
+FORM_LABEL_ON_LINE_TOLERANCE_PT = 2.5
+FORM_LABEL_COLORED_MAX_DISTANCE_PT = 4.0
+FORM_FIELD_BLANK_HEIGHT_PT = 13.0
 
 # Footer detection
 ENABLE_FOOTER_DETECTION = True
@@ -735,6 +742,17 @@ def find_form_label(field_line, raw_blocks):
             center_text = (bx0 + bx1) / 2
             center_distance = abs(center_field - center_text)
 
+            line_color = line_dominant_color(line_data)
+            # Colored text in forms is often a section/subsection heading.
+            # Do not consume it as a field label unless it sits essentially
+            # on the field line itself. This preserves colored subheadings in
+            # arbitrary PDFs without relying on specific words or page numbers.
+            if (
+                not color_is_near_black(line_color)
+                and abs(vertical_distance) > FORM_LABEL_COLORED_MAX_DISTANCE_PT
+            ):
+                continue
+
             score = (
                 abs(vertical_distance) * 4
                 + center_distance
@@ -747,6 +765,7 @@ def find_form_label(field_line, raw_blocks):
                 "bbox": bbox,
                 "line_index": line_index,
                 "source_block_bbox": block.get("bbox", {}),
+                "color": line_color,
             })
 
     if not candidates:
@@ -755,6 +774,7 @@ def find_form_label(field_line, raw_blocks):
             "bbox": None,
             "line_index": None,
             "source_block_bbox": None,
+            "color": "#000000",
         }
 
     candidates.sort(key=lambda item: item["score"])
@@ -765,7 +785,71 @@ def find_form_label(field_line, raw_blocks):
         "bbox": best["bbox"],
         "line_index": best["line_index"],
         "source_block_bbox": best["source_block_bbox"],
+        "color": best.get("color", "#000000"),
     }
+
+
+def line_dominant_color(line_data):
+    colors = []
+    for span in (line_data.get("spans", []) or []):
+        color = (span.get("color") or {}).get("hex", "#000000")
+        if color:
+            colors.append(str(color).upper())
+    if not colors:
+        return "#000000"
+    try:
+        return statistics.mode(colors)
+    except Exception:
+        return colors[0]
+
+
+def color_is_near_black(hex_color):
+    try:
+        value = str(hex_color or "#000000").lstrip("#")
+        if len(value) != 6:
+            return True
+        r, g, b = int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16)
+        return max(r, g, b) <= 70
+    except Exception:
+        return True
+
+
+def classify_label_position(label_bbox, field_y):
+    if not label_bbox:
+        return "unknown"
+    y0 = float(label_bbox.get("y0", field_y))
+    y1 = float(label_bbox.get("y1", field_y))
+    if y0 >= field_y - FORM_LABEL_ON_LINE_TOLERANCE_PT:
+        return "below"
+    if y1 <= field_y + FORM_LABEL_ON_LINE_TOLERANCE_PT:
+        return "above"
+    return "overlap"
+
+
+def set_paragraph_bottom_border(paragraph, size=5, color="000000"):
+    p = paragraph._p
+    pPr = p.get_or_add_pPr()
+    pBdr = pPr.find(qn("w:pBdr"))
+    if pBdr is None:
+        pBdr = OxmlElement("w:pBdr")
+        pPr.append(pBdr)
+    bottom = pBdr.find(qn("w:bottom"))
+    if bottom is None:
+        bottom = OxmlElement("w:bottom")
+        pBdr.append(bottom)
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), str(size))
+    bottom.set(qn("w:space"), "0")
+    bottom.set(qn("w:color"), str(color).replace("#", ""))
+
+
+def apply_hex_font_color(run, hex_color):
+    try:
+        value = str(hex_color or "").replace("#", "").upper()
+        if len(value) == 6:
+            run.font.color.rgb = RGBColor.from_string(value)
+    except Exception:
+        pass
 
 
 def detect_field_type(label, line, vertical_info):
@@ -910,6 +994,8 @@ def detect_form_structure(form_lines, vertical_lines, raw_blocks):
             "label_bbox": label_info["bbox"],
             "label_line_index": label_info.get("line_index"),
             "label_source_block_bbox": label_info.get("source_block_bbox"),
+            "label_color": label_info.get("color", "#000000"),
+            "label_position": classify_label_position(label_info.get("bbox"), y),
             "left_border": vertical_info["left_border"],
             "right_border": vertical_info["right_border"],
             "internal_borders": vertical_info["internal_borders"],
@@ -2226,6 +2312,8 @@ def add_basic_text_block(
             False,
         )
     )
+    # Preserve source text color (e.g. colored form subsection headings).
+    apply_hex_font_color(run, style.get("color", "#000000"))
 
     return y1
 
@@ -2666,15 +2754,7 @@ def add_form_row(
             end=20,
         )
 
-        paragraph = cell.paragraphs[0]
-        paragraph.paragraph_format.space_before = Pt(0)
-        paragraph.paragraph_format.space_after = Pt(0)
-        paragraph.paragraph_format.line_spacing = 1
-
-        # A single PDF block may contain several labels. Match the visual
-        # label line, then take the same line from the translated block.
-        # Claiming happens per (element_id, line_index), so one source block
-        # can safely serve multiple distinct fields without being duplicated.
+        # Match the visual label line to the translated source element.
         label_match = find_best_form_label_element(
             field,
             page_elements,
@@ -2688,76 +2768,65 @@ def add_form_row(
             line_index = label_match.get("line_index")
 
             translated_block = clean_text(
-                translations.get(
-                    label_id,
-                    label_element.get("text", ""),
-                )
+                translations.get(label_id, label_element.get("text", ""))
             )
-
             translated_lines = [
                 clean_text(part)
                 for part in translated_block.splitlines()
                 if clean_text(part)
             ]
 
-            if (
-                line_index is not None
-                and 0 <= int(line_index) < len(translated_lines)
-            ):
+            if line_index is not None and 0 <= int(line_index) < len(translated_lines):
                 label = translated_lines[int(line_index)]
             elif len(translated_lines) == 1:
                 label = translated_lines[0]
 
             claimed_label_keys.add(label_match["claim_key"])
             if label_id:
-                # The whole source block is a form-label carrier and must not
-                # later be emitted again as body text.
                 rendered_ids.add(label_id)
 
-        # Never fall back to the raw German field label here. If a translated
-        # line cannot be matched safely, leave the visual field blank instead
-        # of reintroducing duplicate source-language text.
+        # Remove the default paragraph content and rebuild the field according
+        # to the detected PDF geometry. This is intentionally generic: labels
+        # below the PDF line stay below it; labels above stay above it.
+        first_p = cell.paragraphs[0]
+        first_p.text = ""
+        label_position = field.get("label_position", "above")
 
-        if label:
-            run = paragraph.add_run(label)
+        def _configure(p, blank=False):
+            p.paragraph_format.space_before = Pt(0)
+            p.paragraph_format.space_after = Pt(0)
+            p.paragraph_format.line_spacing = 1
+
+        def _add_label(p):
+            _configure(p)
+            run = p.add_run(label if label else " ")
             run.font.name = DEFAULT_FONT_NAME
             run.font.size = Pt(FORM_DOCX_FONT_PT)
+            apply_hex_font_color(run, field.get("label_color", "#000000"))
+
+        def _add_writing_line(p):
+            _configure(p, blank=True)
+            p.paragraph_format.line_spacing = Pt(FORM_FIELD_BLANK_HEIGHT_PT)
+            r = p.add_run(" ")
+            r.font.size = Pt(FORM_FIELD_BLANK_HEIGHT_PT)
+            set_paragraph_bottom_border(p, size=5, color="000000")
+
+        if label_position == "below":
+            _add_writing_line(first_p)
+            _add_label(cell.add_paragraph())
         else:
-            run = paragraph.add_run(" ")
-            run.font.name = DEFAULT_FONT_NAME
-            run.font.size = Pt(FORM_DOCX_FONT_PT)
+            _add_label(first_p)
+            _add_writing_line(cell.add_paragraph())
 
-        # Formun esas yazma çizgisi: alt border
+        # Keep only real vertical box boundaries at cell level. The horizontal
+        # writing line is rendered as a paragraph border so its relation to the
+        # label can be preserved on either side.
         set_cell_border(
             cell,
             top=None,
-            left=(
-                {
-                    "val": "single",
-                    "sz": 4,
-                    "color": "000000",
-                }
-                if field.get(
-                    "left_border"
-                )
-                else None
-            ),
-            bottom={
-                "val": "single",
-                "sz": 5,
-                "color": "000000",
-            },
-            right=(
-                {
-                    "val": "single",
-                    "sz": 4,
-                    "color": "000000",
-                }
-                if field.get(
-                    "right_border"
-                )
-                else None
-            ),
+            left=({"val": "single", "sz": 4, "color": "000000"} if field.get("left_border") else None),
+            bottom=None,
+            right=({"val": "single", "sz": 4, "color": "000000"} if field.get("right_border") else None),
         )
 
     return row_y
